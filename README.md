@@ -272,16 +272,71 @@ bellhaven-sync/
 - **SQLite plus a CI cache.** No infrastructure to run. Cost: the cache is not durable
   storage and the review app works on a copy; see Scheduling for the production options.
 
-Results:
+Results (against the CRM snapshot captured 2026-10-11, `tests/fixtures/crm`):
 
-<!-- TODO orchestrator: fill after review -->
-
-- Website locations scraped: <!-- TODO orchestrator: fill after review -->
-- CRM accounts / contacts read: <!-- TODO orchestrator: fill after review -->
-- Proposals by kind: <!-- TODO orchestrator: fill after review -->
-- Approved and applied: <!-- TODO orchestrator: fill after review -->
-- Tests: <!-- TODO orchestrator: fill after review -->
+- Website locations scraped: 35 (34 in the directory plus Findlay from the homepage).
+- CRM accounts / contacts read: 121 / 67.
+- Proposals: 46. Confirmed 18, rename 7 (3 real renames, 4 cosmetic), reparent 4,
+  chow_reparent 2, duplicate 7, create 4, chow_out 1, not_on_website 2, parent_acquired 1.
+  28 are actionable; applying them all makes 30 API writes (6 creates, 24 patches), and the
+  next run converges to 35 confirmed and nothing else.
+- Live CRM copy: see "What happened to the live copy" in the writeup below.
+- Tests: `uv run pytest -q` runs the whole suite offline in about a second; one live smoke
+  test is opt-in with `-m live`.
 
 ## Writeup
 
-<!-- TODO orchestrator: fill after review -->
+**Matching approach.** The website is treated as the source of truth for which communities
+Bellhaven runs. Each scraped location is normalised (names: `&`/and, Rehab/Rehabilitation,
+Centre/Center, stopwords; streets: USPS abbreviations; phones: digits) and compared only
+against CRM accounts in the same state with the same zip or city. Within that block, a
+street match is worth most, then phone, then "the website's administrator is a contact on
+this account", then fuzzy name similarity. A location matches when the address matches, or
+when phone and administrator both match (Ashtabula bills to a PO Box). Several address
+matches form a duplicate cluster; the survivor is chosen by a fixed ordering (already under
+Bellhaven, has revenue, phone match, contact match, name similarity, contact count, lowest
+id) and the losers get `duplicate_of_account` and Inactive. Name similarity alone never
+matches across a different street when the phone and administrator also differ, which is
+what keeps "Union Square Senior Living" (Juniper Point) from being hijacked, and the state
+block keeps "Amberly Manor" (Colorado) and "New Carlisle" out of the picture. The
+change-of-ownership SOP is a single predicate (`lifetime_revenue > 0 and outstanding_ar > 0`)
+applied before any re-parent: Tiffin and Marietta get a new account plus a CHOW pointer,
+Lima and Findlay are re-parented directly. Bellhaven accounts that are not on the website
+either point at the new owner when one exists at the same address (Sandusky, now Millstone)
+or go to Needs Review (Alliance, Coldwater). The Harborview parent, whose children are all
+reconciled and which the About page names as acquired, is proposed Inactive at low priority
+for a human to decide.
+
+**What happened to the live copy.** The exploration, spec and all code were built against a
+snapshot of the sandbox taken at the start. Before this pipeline's first live run, the same
+CRM copy had already been corrected by a separate agent session working from the same
+token (its notes are prefixed "[Bellhaven review ...]"). Its outcome agrees with this
+pipeline's on every location, with three differences: it set Sandusky to Needs Review
+instead of pointing it at Millstone, chose a different Kettering survivor (the orphaned
+copy; this pipeline's tie-break would have picked the Harborview copy, which is why the
+tie-break is documented in each proposal), and also fixed Portsmouth's zip and added the
+second care offering to two accounts. This pipeline's first live run therefore produced 35
+confirmed matches and left two live proposals in the queue: the Sandusky CHOW pointer
+(approved, it lands in the CRM) and the Harborview parent (reviewer's call). That is also
+the convergence property the design relies on: once the CRM is right, a run proposes
+nothing. The full day-one queue can be replayed at any time with `--snapshot`.
+
+**How AI tools were used.** Claude Code acted as orchestrator: it explored the site and API
+by hand, wrote the design spec, the data model, the SQLite store and the CRM client, then
+dispatched four Opus subagents in parallel against that contract (scraper; matcher,
+proposals, pipeline and CLI; review app and apply; schedule and docs), each working
+test-first on disjoint files. The orchestrator verified every report by re-running the
+tests and the live scrape itself, caught one real mistake of its own (an exploratory PATCH
+that the API accepted because `care_type` is free text; reverted within the minute), and
+diffed the live CRM against the snapshot to discover the parallel session's writes rather
+than trusting the "everything confirmed" summary.
+
+**What I would build next.** (1) Persist the state db somewhere durable (a `state` branch
+or S3) so reviewer decisions made on a laptop flow back to the scheduled run. (2) A
+"facility identity" table keyed on normalised address so the matcher can carry forward
+survivor choices and CHOW chains across days instead of recomputing them. (3) Proposals
+for field drift on confirmed matches (zip typos, second care offerings, phone) behind a
+separate low-priority tab, since the pipeline already has the evidence. (4) Alerting when
+the scrape count drops, which is the one failure that could silently turn every account
+into "not on website"; today the run refuses to proceed on an empty scrape but does not
+page anyone.

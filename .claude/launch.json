@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "review-live",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": ["run", "bellhaven-sync", "review"],
+      "port": 8000
+    },
+    {
+      "name": "review-snapshot",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": ["run", "bellhaven-sync", "review", "--snapshot", "tests/fixtures/crm", "--db", "data/snapshot.db"],
+      "port": 8000
+    }
+  ]
+}

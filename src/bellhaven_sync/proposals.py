@@ -73,6 +73,14 @@ def resolve_parent_id(
     return hits[0].account_id
 
 
+def care_type_consistent(crm_value: str, mapped: list[str]) -> bool:
+    """True when the CRM care_type agrees with the website offerings. Accepts a
+    multi-valued CRM string ("Assisted Living; Memory Care") as long as every part is one
+    of the mapped website offerings, so a richer value is never 'corrected' downward."""
+    parts = [p.strip() for p in re.split(r"[;,/|]| and ", crm_value) if p.strip()]
+    return bool(parts) and all(p in mapped for p in parts)
+
+
 def parent_label(account: Account) -> str:
     """'Harborview Care Group (Parent Account)' -> 'Harborview Care Group'."""
     return _PARENT_SUFFIX_RE.sub("", account.name).strip()
@@ -237,7 +245,7 @@ class _Builder:
         if site.phone and not s.phone_match:
             notes.append(f"CRM phone '{a.phone or '-'}' differs from the website phone '{site.phone}' (not changed).")
         mapped = map_care_types(site.care_offerings)
-        if a.care_type and mapped and a.care_type not in mapped:
+        if a.care_type and mapped and not care_type_consistent(a.care_type, mapped):
             notes.append(
                 f"CRM care_type '{a.care_type}' vs website offerings {', '.join(site.care_offerings)} "
                 f"(maps to {', '.join(mapped)}); {drift}."
@@ -636,7 +644,7 @@ def _field_drift_proposal(b: _Builder, m: LocationMatch) -> Proposal | None:
         drift["billing_zip"] = {"crm": a.billing_zip, "website": site.zip}
         changes.append(f"billing_zip '{a.billing_zip}' -> '{site.zip}'")
     mapped = map_care_types(site.care_offerings)
-    if a.care_type and mapped and a.care_type not in mapped:
+    if a.care_type and mapped and not care_type_consistent(a.care_type, mapped):
         fields["care_type"] = mapped[0]
         drift["care_type"] = {"crm": a.care_type, "website": list(site.care_offerings), "mapped": mapped}
         changes.append(f"care_type '{a.care_type}' -> '{mapped[0]}'")

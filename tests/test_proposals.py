@@ -652,3 +652,15 @@ def test_not_on_website_still_only_for_active(site_locations, crm_accounts, crm_
     subjects = _by_subject(_build(site_locations, accts, crm_contacts, about_text))
     assert "0016PVXH4B25HWR7QE" not in subjects
     assert subjects["00116ETS45BL7DTQP7"].kind == ProposalKind.NOT_ON_WEBSITE
+
+
+def test_care_type_consistent_accepts_multivalue_from_other_tools():
+    from bellhaven_sync.proposals import care_type_consistent
+
+    mapped = ["Assisted Living", "Memory Care"]
+    assert care_type_consistent("Assisted Living", mapped)
+    assert care_type_consistent("Assisted Living; Memory Care", mapped)
+    assert care_type_consistent("Memory Care / Assisted Living", mapped)
+    assert not care_type_consistent("Skilled Nursing", mapped)
+    assert not care_type_consistent("Assisted Living; Skilled Nursing", mapped)
+    assert not care_type_consistent("", mapped)

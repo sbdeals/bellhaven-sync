@@ -6,3 +6,4 @@ data/*.db
 data/*.db-journal
 .env
 data/*.json
+demo/output/

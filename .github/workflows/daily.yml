@@ -1,0 +1,126 @@
+# Bellhaven CRM sync: daily scheduled run.
+#
+# This workflow runs `bellhaven-sync run`: scrape the Bellhaven website, read the CRM,
+# match, and store correction proposals in the SQLite state db. That command is
+# READ-ONLY against the CRM. This workflow never writes to the CRM.
+#
+# CRM writes happen only when a human approves a proposal in the local review app,
+# which a reviewer runs on demand on their own machine:
+#     uv run bellhaven-sync review      # http://127.0.0.1:8000
+# Nothing here starts the review app or calls apply.
+#
+# Failure policy: the CLI exits non-zero on any exception (scrape error, CRM read error,
+# bad config), so this job fails loudly and GitHub sends the usual failure notification.
+
+name: bellhaven-sync daily
+
+on:
+  schedule:
+    - cron: "0 11 * * *" # 11:00 UTC daily = 07:00 EDT (06:00 EST in winter)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never run two syncs at once, and never cancel a run that may be saving state.
+concurrency:
+  group: bellhaven-sync
+  cancel-in-progress: false
+
+env:
+  BELLHAVEN_DB_PATH: data/bellhaven_sync.db
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up uv and Python 3.12
+        uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Install dependencies (locked)
+        run: uv sync --frozen
+
+      # Why a cache: the SQLite db holds every proposal AND every reviewer decision.
+      # It must survive from one run to the next, otherwise each run starts empty and
+      # re-proposes items that were already approved, rejected or applied.
+      #
+      # Cache entries are immutable, so the key cannot literally be constant (a second
+      # save under the same key is refused and the db would stop updating). Instead every
+      # run saves under a unique key with a constant prefix, and the restore below asks
+      # for a key that never exists, so `restore-keys` falls back to the NEWEST entry
+      # with that prefix. Caches unused for 7 days are evicted; the daily run keeps it warm,
+      # and the uploaded artifact below is a 30-day backup.
+      #
+      # For a real deployment prefer a durable store that the review app can also reach:
+      # commit data/bellhaven_sync.db back to a dedicated `state` branch, or keep it in S3
+      # (aws s3 cp down before the run, up after it).
+      - name: Restore previous state db
+        id: restore-db
+        uses: actions/cache/restore@v4
+        with:
+          path: data/bellhaven_sync.db
+          key: bellhaven-sync-db-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            bellhaven-sync-db-
+
+      - name: Warn when starting without previous state
+        if: steps.restore-db.outputs.cache-matched-key == ''
+        run: echo "::warning::No previous state db was restored. This run starts a fresh db, so earlier reviewer decisions are not visible to it."
+
+      - name: Run bellhaven-sync (read-only against the CRM)
+        shell: bash
+        env:
+          BELLHAVEN_CRM_TOKEN: ${{ secrets.BELLHAVEN_CRM_TOKEN }}
+          BELLHAVEN_BASE_URL: ${{ vars.BELLHAVEN_BASE_URL || 'https://analyst-assessment-production.up.railway.app' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BELLHAVEN_CRM_TOKEN}" ]; then
+            echo "::error::BELLHAVEN_CRM_TOKEN secret is not set"
+            exit 1
+          fi
+          mkdir -p data logs
+          echo "run started $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee logs/run.log
+          # pipefail makes a non-zero exit from the CLI fail this step despite the tee
+          uv run bellhaven-sync run 2>&1 | tee -a logs/run.log
+          echo "run finished $(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a logs/run.log
+
+      - name: Write store status to the job summary
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo '### bellhaven-sync status'
+            echo '```'
+            uv run bellhaven-sync status
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Save even if the run step failed. The store writes a run's proposals in one
+      # transaction, so a failed run leaves proposals and decisions as they were (at most
+      # an unfinished row in `runs`); saving it is harmless. If the run died before the db
+      # existed, the hashFiles guard skips the save instead of erroring.
+      - name: Save state db
+        if: always() && hashFiles('data/bellhaven_sync.db') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: data/bellhaven_sync.db
+          key: bellhaven-sync-db-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # Downloadable copy of the db (for review with `bellhaven-sync review`) and the log.
+      - name: Upload state db and run log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bellhaven-sync-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            data/bellhaven_sync.db
+            logs/run.log
+          retention-days: 30
+          if-no-files-found: warn

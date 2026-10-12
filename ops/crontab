@@ -1,0 +1,24 @@
+# bellhaven-sync: daily run on a Linux VM (equivalent of .github/workflows/daily.yml).
+#
+# Install for a dedicated service user that owns /opt/bellhaven-sync and ran `uv sync`:
+#     sudo mkdir -p /var/log/bellhaven-sync && sudo chown bellhaven /var/log/bellhaven-sync
+#     sudo install -m 600 -o bellhaven /dev/null /etc/bellhaven-sync.env   # then add BELLHAVEN_* vars
+#     sudo crontab -u bellhaven /opt/bellhaven-sync/ops/crontab
+#
+# Times are in the VM's clock. Cloud VMs normally run on UTC, so 11:00 = 07:00 EDT.
+# (With cronie you can pin it explicitly by uncommenting the next line.)
+# CRON_TZ=UTC
+#
+# `bellhaven-sync run` is read-only against the CRM. The db (data/bellhaven_sync.db)
+# lives on this VM's disk, so decisions persist between runs without any extra step.
+# CRM writes only happen from the review app, started on demand by a reviewer
+# (`uv run bellhaven-sync review`, reached through `ssh -L 8000:127.0.0.1:8000`).
+
+# Recommended: the wrapper adds flock (no overlapping runs), loads /etc/bellhaven-sync.env,
+# a 15-minute timeout and start/end timestamps. A non-zero exit means the run failed;
+# to be alerted, append `|| <your alert command>` to the entry.
+0 11 * * * /opt/bellhaven-sync/ops/run-daily.sh >> /var/log/bellhaven-sync/run.log 2>&1
+
+# Minimal equivalent without the wrapper (reads /opt/bellhaven-sync/.env instead).
+# Use one entry or the other, never both.
+# 0 11 * * * cd /opt/bellhaven-sync && /usr/local/bin/uv run bellhaven-sync run >> /var/log/bellhaven-sync/run.log 2>&1

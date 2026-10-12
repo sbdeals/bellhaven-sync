@@ -2,6 +2,11 @@
 
 `run` is read-only against the CRM (it only records proposals in the local store); the
 only path that writes to the CRM is an Approve click in the review app.
+
+`--snapshot DIR` (run / review / scrape) swaps the live CRM for `snapshot.SnapshotCRM(DIR)`
+and the live website for the captured HTML in `DIR/../site` (when present), so the day-one
+queue can be demoed after the live sandbox has been corrected. Approvals then write only to
+`<db-dir>/snapshot_state.json`; the store defaults to `<db-dir>/snapshot.db`.
 """
 
 from __future__ import annotations
@@ -21,6 +26,7 @@ from .models import PRIORITY_ORDER
 log = logging.getLogger("bellhaven_sync.cli")
 
 PRIORITIES = ("high", "medium", "low")
+SNAPSHOT_BANNER = "SNAPSHOT MODE — no live CRM writes"
 
 
 # --------------------------------------------------------------------------- seams
@@ -32,9 +38,11 @@ def _make_crm(settings: Settings) -> Any:
     return CRMClient(settings.base_url, settings.token)
 
 
-def _scrape(settings: Settings) -> Any:
+def _scrape(settings: Settings, fetch: Any = None) -> Any:
     from .scraper import http_fetcher, scrape_site
 
+    if fetch is not None:
+        return scrape_site(fetch, settings.site_url)
     fetcher = http_fetcher(settings.site_url)
     try:
         return scrape_site(fetcher, settings.site_url)
@@ -48,7 +56,30 @@ def _settings(args: argparse.Namespace) -> Settings:
     settings = get_settings()
     if getattr(args, "db", None):
         settings = replace(settings, db_path=Path(args.db))
+    elif getattr(args, "snapshot", None):
+        # keep snapshot proposals and decisions apart from the live store
+        settings = replace(settings, db_path=settings.db_path.parent / "snapshot.db")
     return settings
+
+
+def _snapshot_site_dir(snapshot_dir: Path) -> Path | None:
+    site = snapshot_dir.resolve().parent / "site"
+    return site if (site / "index.html").is_file() else None
+
+
+def _snapshot_setup(args: argparse.Namespace, settings: Settings) -> tuple[Any, Any]:
+    """(SnapshotCRM, fixture fetcher or None) for `--snapshot DIR`; prints the banner."""
+    from .snapshot import SnapshotCRM, default_state_path, fixture_fetcher
+
+    snap_dir = Path(args.snapshot)
+    state = default_state_path(settings.db_path)
+    crm = SnapshotCRM(snap_dir, state_path=state)
+    site = _snapshot_site_dir(snap_dir)
+    print(SNAPSHOT_BANNER)
+    print(f"  CRM snapshot : {snap_dir}  (writes persist to {state})")
+    print(f"  website      : {site if site else settings.site_url + ' (live, read-only)'}")
+    print(f"  store        : {settings.db_path}\n")
+    return crm, (fixture_fetcher(site) if site else None)
 
 
 def _print_table(headers: Sequence[str], rows: Sequence[Sequence[Any]]) -> None:
@@ -68,12 +99,17 @@ def cmd_run(args: argparse.Namespace) -> int:
     from .store import Store
 
     settings = _settings(args)
-    if not settings.token:
-        print("BELLHAVEN_CRM_TOKEN is not set (env or .env); cannot read the CRM.", file=sys.stderr)
-        return 2
+    if getattr(args, "snapshot", None):
+        crm, fetch = _snapshot_setup(args, settings)
+        scrape_result = _scrape(settings, fetch) if fetch is not None else _scrape(settings)
+    else:
+        if not settings.token:
+            print("BELLHAVEN_CRM_TOKEN is not set (env or .env); cannot read the CRM.", file=sys.stderr)
+            return 2
+        crm, scrape_result = _make_crm(settings), _scrape(settings)
     store = Store(settings.db_path)
     try:
-        report = run(settings, crm=_make_crm(settings), store=store, scrape_result=_scrape(settings))
+        report = run(settings, crm=crm, store=store, scrape_result=scrape_result)
     finally:
         store.close()
 
@@ -97,13 +133,19 @@ def cmd_run(args: argparse.Namespace) -> int:
         )
     s = report.summary
     print(f"\nStore: new={s.new} refreshed={s.refreshed} previously_decided={s.previously_decided} stale={s.stale}")
-    print(f"Review with: bellhaven-sync review  (http://{settings.review_host}:{settings.review_port})")
+    snap = f" --snapshot {args.snapshot} --db {settings.db_path}" if getattr(args, "snapshot", None) else ""
+    print(f"Review with: bellhaven-sync review{snap}  (http://{settings.review_host}:{settings.review_port})")
     return 0
 
 
 def cmd_scrape(args: argparse.Namespace) -> int:
+    from .snapshot import fixture_fetcher
+
     settings = _settings(args)
-    result = _scrape(settings)
+    site = _snapshot_site_dir(Path(args.snapshot)) if getattr(args, "snapshot", None) else None
+    if site:
+        print(f"{SNAPSHOT_BANNER} (captured website: {site})", file=sys.stderr)
+    result = _scrape(settings, fixture_fetcher(site)) if site else _scrape(settings)
     print(json.dumps([loc.to_dict() for loc in result.locations], indent=2, ensure_ascii=False))
     print(
         f"{len(result.locations)} locations; directory lists {result.directory_count} over "
@@ -158,10 +200,14 @@ def cmd_review(args: argparse.Namespace) -> int:
     from .store import Store
 
     settings = _settings(args)
-    if not settings.token:
+    if getattr(args, "snapshot", None):
+        crm, _fetch = _snapshot_setup(args, settings)  # Approve writes to the snapshot state file only
+    elif not settings.token:
         print("BELLHAVEN_CRM_TOKEN is not set (env or .env); the review app needs it to apply changes.", file=sys.stderr)
         return 2
-    app = create_app(settings, Store(settings.db_path), CRMClient(settings.base_url, settings.token))
+    else:
+        crm = CRMClient(settings.base_url, settings.token)
+    app = create_app(settings, Store(settings.db_path), crm)
     uvicorn.run(app, host=settings.review_host, port=settings.review_port)
     return 0
 
@@ -170,16 +216,30 @@ def cmd_review(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    db_help = "SQLite store path (default: BELLHAVEN_DB_PATH or data/bellhaven_sync.db; data/snapshot.db with --snapshot)"
     parser = argparse.ArgumentParser(prog="bellhaven-sync", description=__doc__.splitlines()[0])
-    parser.add_argument("--db", help="SQLite store path (default: BELLHAVEN_DB_PATH or data/bellhaven_sync.db)")
+    parser.add_argument("--db", help=db_help)
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
+    # --db is accepted before or after the subcommand
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--db", default=argparse.SUPPRESS, help=db_help)
+    snapshot = argparse.ArgumentParser(add_help=False)
+    snapshot.add_argument(
+        "--snapshot", metavar="DIR",
+        help="use captured CRM JSON in DIR (accounts.json, contacts.json) and captured HTML in DIR/../site "
+        "instead of the live CRM and website; writes go to <db-dir>/snapshot_state.json",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("run", help="scrape + reconcile + record proposals (read-only against the CRM)").set_defaults(func=cmd_run)
-    sub.add_parser("scrape", help="scrape the website and print the locations as JSON").set_defaults(func=cmd_scrape)
-    p_status = sub.add_parser("status", help="show proposal counts and recent runs")
+    sub.add_parser(
+        "run", parents=[common, snapshot], help="scrape + reconcile + record proposals (read-only against the CRM)"
+    ).set_defaults(func=cmd_run)
+    sub.add_parser(
+        "scrape", parents=[common, snapshot], help="scrape the website and print the locations as JSON"
+    ).set_defaults(func=cmd_scrape)
+    p_status = sub.add_parser("status", parents=[common], help="show proposal counts and recent runs")
     p_status.add_argument("--runs", type=int, default=5, help="how many recent runs to show")
     p_status.set_defaults(func=cmd_status)
-    sub.add_parser("review", help="launch the local review app").set_defaults(func=cmd_review)
+    sub.add_parser("review", parents=[common, snapshot], help="launch the local review app").set_defaults(func=cmd_review)
     return parser
 
 
@@ -192,8 +252,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     for stream in (sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if callable(reconfigure):
-            try:
-                reconfigure(errors="replace")
+            try:  # UTF-8 even when piped on Windows (cp1252 otherwise mangles the banner / names)
+                reconfigure(encoding="utf-8", errors="replace")
             except (ValueError, OSError):  # pragma: no cover - exotic streams
                 pass
     return int(args.func(args) or 0)

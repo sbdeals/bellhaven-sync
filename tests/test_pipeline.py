@@ -212,3 +212,23 @@ def test_pipeline_with_real_scraper_on_captured_html(settings, fake_crm, site_ht
     harborview = next(p for p in report.proposals if p.kind == ProposalKind.PARENT_ACQUIRED)
     assert "Harborview Care Group" in harborview.evidence["about_text"]
     assert fake_crm.writes == []
+
+
+def test_sandusky_needs_review_still_gets_chow_out(settings, scrape) -> None:
+    """Live sandbox state on 2026-10-11: Sandusky already flagged Needs Review by another tool,
+    chow pointer still empty, Millstone at the same address."""
+    import json
+
+    from tests.fakes import FIXTURES, FakeCRM
+
+    rows = json.loads((FIXTURES / "crm" / "accounts.json").read_text(encoding="utf-8"))["data"]
+    for r in rows:
+        if r["account_id"] == "001SXSF4ELF0Z2LGDM":
+            r["status"] = "Needs Review"
+    crm = FakeCRM(accounts=rows)
+    report = _run(settings, crm, Store(), scrape)
+    mine = [p for p in report.proposals if p.subject_account_id == "001SXSF4ELF0Z2LGDM"]
+    assert [str(p.kind) for p in mine] == ["chow_out"]
+    assert mine[0].actions[0].fields["chow_current_account"] == "0017JP8Z1UQ763BVK3"
+    assert not any(p.kind == ProposalKind.NOT_ON_WEBSITE and p.subject_account_id == "001SXSF4ELF0Z2LGDM" for p in report.proposals)
+    assert crm.writes == []

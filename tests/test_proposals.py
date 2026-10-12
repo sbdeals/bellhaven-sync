@@ -505,3 +505,31 @@ def test_null_money_fields_do_not_break_notes(site_locations, crm_accounts, crm_
     accts = _patched(crm_accounts, "00116ETS45BL7DTQP7", lifetime_revenue="", outstanding_ar="")
     p = _by_subject(_build(site_locations, accts, crm_contacts, about_text))["00116ETS45BL7DTQP7"]
     assert p.kind == ProposalKind.NOT_ON_WEBSITE and "$0" in p.evidence["notes"][0]
+
+
+@pytest.mark.parametrize("status", ["Needs Review", "Active"])
+def test_chow_out_fires_for_needs_review_and_active(site_locations, crm_accounts, crm_contacts, about_text, status) -> None:
+    accts = _patched(crm_accounts, "001SXSF4ELF0Z2LGDM", status=status)
+    props = _build(site_locations, accts, crm_contacts, about_text)
+    mine = [p for p in props if p.subject_account_id == "001SXSF4ELF0Z2LGDM"]
+    assert [str(p.kind) for p in mine] == ["chow_out"]
+    (a,) = mine[0].actions
+    assert set(a.fields) == {"chow_current_account", "note"}  # status/parent never touched
+    assert a.fields["chow_current_account"] == "0017JP8Z1UQ763BVK3"
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [{"status": "Inactive"}, {"chow_current_account": "0017JP8Z1UQ763BVK3"}, {"duplicate_of_account": "001UELXDAKFRKB8932"}],
+)
+def test_chow_out_skips_inactive_and_superseded(site_locations, crm_accounts, crm_contacts, about_text, changes) -> None:
+    accts = _patched(crm_accounts, "001SXSF4ELF0Z2LGDM", **changes)
+    subjects = _by_subject(_build(site_locations, accts, crm_contacts, about_text))
+    assert "001SXSF4ELF0Z2LGDM" not in subjects
+
+
+def test_not_on_website_still_only_for_active(site_locations, crm_accounts, crm_contacts, about_text) -> None:
+    accts = _patched(crm_accounts, "0016PVXH4B25HWR7QE", status="Needs Review")  # Coldwater: no other owner
+    subjects = _by_subject(_build(site_locations, accts, crm_contacts, about_text))
+    assert "0016PVXH4B25HWR7QE" not in subjects
+    assert subjects["00116ETS45BL7DTQP7"].kind == ProposalKind.NOT_ON_WEBSITE

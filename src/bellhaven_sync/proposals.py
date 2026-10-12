@@ -480,10 +480,16 @@ def _create_proposal(b: _Builder, m: LocationMatch) -> Proposal:
 
 
 def _crm_only_proposals(b: _Builder, matched_ids: set[str]) -> list[Proposal]:
+    """Bellhaven children with no website match.
+
+    chow_out: any non-superseded, non-Inactive child (Active OR Needs Review) whose address is
+    shared by another operator's account gets the chow pointer; status/parent never touched.
+    not_on_website: only Active children with no other owner; Needs Review/Inactive are left alone.
+    """
     out = []
     for a in b.accounts:
         if (
-            a.parent_id != b.bh or a.status != "Active" or a.is_superseded
+            a.parent_id != b.bh or a.status == "Inactive" or a.is_superseded
             or is_parent_like(a, b.parent_ids) or a.account_id in matched_ids
         ):
             continue
@@ -521,9 +527,10 @@ def _crm_only_proposals(b: _Builder, matched_ids: set[str]) -> list[Proposal]:
                     actions=[action],
                     evidence=b.evidence(
                         site=None, accounts=[(a, "subject"), (o, "new_owner")], score=None,
-                        rule="Active Bellhaven account missing from the website whose normalised street+zip is shared by "
-                        "another operator's account: chow_out (pointer only, per SOP).",
+                        rule="Bellhaven account (Active or Needs Review) missing from the website whose normalised "
+                        "street+zip is shared by another operator's account: chow_out (pointer only, per SOP).",
                         notes=[
+                            f"Current status '{a.status}' is left as is.",
                             f"Same normalised address: '{a.billing_street}' / '{o.billing_street}', zip {a.billing_zip}.",
                             *(
                                 [f"Other accounts at this address: {', '.join(x.account_id for x in owners[1:])}."]
@@ -536,7 +543,7 @@ def _crm_only_proposals(b: _Builder, matched_ids: set[str]) -> list[Proposal]:
                     site_slug=None,
                 )
             )
-        else:
+        elif a.status == "Active":
             action = b.patch(
                 a, {"status": "Needs Review"},
                 f"Not listed on the Bellhaven website and no other operator found at {a.billing_street}, "

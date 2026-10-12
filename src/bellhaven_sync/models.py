@@ -116,6 +116,7 @@ class ProposalKind(StrEnum):
     CHOW_OUT = "chow_out"                # Bellhaven account superseded by other owner's account
     NOT_ON_WEBSITE = "not_on_website"    # -> Needs Review
     PARENT_ACQUIRED = "parent_acquired"  # acquired parent company -> Inactive
+    FIELD_DRIFT = "field_drift"          # matched Bellhaven account: patch billing_zip / care_type to the website
 
 
 Priority = Literal["high", "medium", "low"]

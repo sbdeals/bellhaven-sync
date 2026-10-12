@@ -22,8 +22,8 @@ from tests.conftest import BELLHAVEN_PARENT_ID, HARBORVIEW_PARENT_ID, SITE
 
 TODAY = date(2026, 10, 11)
 EXPECTED_BY_KIND = {
-    "confirmed": 18, "rename": 7, "reparent": 4, "chow_reparent": 2, "duplicate": 7,
-    "create": 4, "chow_out": 1, "not_on_website": 2, "parent_acquired": 1,
+    "confirmed": 18, "rename": 7, "reparent": 3, "chow_reparent": 2, "duplicate": 5,
+    "create": 4, "chow_out": 1, "not_on_website": 2, "parent_acquired": 1, "field_drift": 1,
 }
 
 
@@ -83,7 +83,7 @@ def test_run_end_to_end(settings, fake_crm, scrape) -> None:
     assert fake_crm.writes == []  # the pipeline never writes to the CRM
     assert store.counts() == {"pending": len(report.proposals)}
     (r,) = store.runs()
-    assert r["finished_at"] and r["site_count"] == 35 and r["crm_count"] == 121 and r["proposals_new"] == 46
+    assert r["finished_at"] and r["site_count"] == 35 and r["crm_count"] == 121 and r["proposals_new"] == 44
 
 
 def test_second_run_is_idempotent(settings, fake_crm, scrape) -> None:
@@ -115,8 +115,10 @@ def test_pipeline_converges_after_applying(settings, fake_crm, scrape) -> None:
             _apply(fake_crm, p)
     second = _run(settings, fake_crm, store, scrape)
     leftover = [p for p in second.proposals if p.kind != ProposalKind.CONFIRMED]
-    # only the low-priority items nobody applied yet remain: 4 cosmetic renames + Harborview parent
-    assert sorted(str(p.kind) for p in leftover) == ["parent_acquired", "rename", "rename", "rename", "rename"]
+    # only the low-priority items nobody applied yet remain: 4 cosmetic renames + Harborview parent + Portsmouth zip
+    assert sorted(str(p.kind) for p in leftover) == [
+        "field_drift", "parent_acquired", "rename", "rename", "rename", "rename",
+    ]
     assert all(p.priority == "low" for p in leftover)
     assert {p.fingerprint for p in leftover} <= {p.fingerprint for p in first.proposals}  # nothing new to review
     assert second.by_kind["confirmed"] == 35 - 4  # every website location now matches one account
@@ -137,6 +139,37 @@ def test_pipeline_converges_after_applying(settings, fake_crm, scrape) -> None:
     assert fake_crm.get_account("001QU150PM4Z15UA71").duplicate_of_account == "001EGU7BMJ942ZTRE6"
     k = fake_crm.get_account("001WR41PYNWXCAE2X4")
     assert (k.name, k.parent_id) == ("Bellhaven of Kettering", BELLHAVEN_PARENT_ID)
+    assert fake_crm.get_account("001CF3LDWVRGL09P4F").billing_zip == "45662"
+
+
+def test_applying_every_proposal_converges(settings, fake_crm, scrape) -> None:
+    store = Store()
+    first = _run(settings, fake_crm, store, scrape)
+    for p in first.proposals:
+        _apply(fake_crm, p)
+    second = _run(settings, fake_crm, store, scrape)
+    assert second.by_kind == {"confirmed": 35}  # nothing actionable is re-proposed
+    for loser in ("0016KTS1UAWBRXS09J", "001B7XZAA3AFALS9GP"):
+        assert fake_crm.get_account(loser).duplicate_of_account == "001WR41PYNWXCAE2X4"
+
+
+def test_group_applied_with_reviewer_chosen_survivor_converges(settings, fake_crm, scrape) -> None:
+    """The review app rebuilds a duplicate group's actions for the reviewer's pick."""
+    from dataclasses import replace
+
+    from bellhaven_sync.proposals import build_duplicate_group_actions
+
+    store = Store()
+    first = _run(settings, fake_crm, store, scrape)
+    for p in first.proposals:
+        if p.kind == ProposalKind.DUPLICATE and p.site_slug == "bellhaven-of-kettering":
+            p = replace(p, actions=build_duplicate_group_actions(p.evidence, "001B7XZAA3AFALS9GP", today=TODAY))
+        _apply(fake_crm, p)
+    second = _run(settings, fake_crm, store, scrape)
+    assert second.by_kind == {"confirmed": 35}
+    k = fake_crm.get_account("001B7XZAA3AFALS9GP")
+    assert (k.name, k.parent_id) == ("Bellhaven of Kettering", BELLHAVEN_PARENT_ID)
+    assert fake_crm.get_account("001WR41PYNWXCAE2X4").duplicate_of_account == "001B7XZAA3AFALS9GP"
 
 
 def test_run_uses_scraper_when_no_result_given(settings, fake_crm, scrape, monkeypatch) -> None:
@@ -191,11 +224,11 @@ def test_cli_run_prints_table(settings, fake_crm, scrape, monkeypatch, capsys) -
     monkeypatch.setattr(cli, "_scrape", lambda s: scrape)
     assert cli.main(["run"]) == 0
     out = capsys.readouterr().out
-    assert "chow_reparent" in out and "high" in out and "new=46" in out
+    assert "chow_reparent" in out and "high" in out and "new=44" in out
     assert fake_crm.writes == []
     assert cli.main(["status"]) == 0
     out = capsys.readouterr().out
-    assert "pending" in out and "46" in out
+    assert "pending" in out and "44" in out
 
 
 def test_pipeline_with_real_scraper_on_captured_html(settings, fake_crm, site_html) -> None:

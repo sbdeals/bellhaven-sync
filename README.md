@@ -100,7 +100,8 @@ scrape -> match -> propose -> review -> apply
 | `reparent` | Matched account is not under Bellhaven and does not meet the SOP condition | PATCH `parent_id` (and `name` if it differs) |
 | `chow_reparent` | Matched account has lifetime revenue AND outstanding AR | POST a new account under Bellhaven, then PATCH the old one's `chow_current_account` + note |
 | `create` | No CRM account matches | POST a new account under Bellhaven |
-| `duplicate` | Several CRM accounts for one location | PATCH each loser: `duplicate_of_account` = survivor, status Inactive (Needs Review if it has revenue and AR) |
+| `duplicate` | Several CRM accounts for one location (one proposal per cluster) | The reviewer picks the survivor (the recommended one is pre-selected; a tie is flagged). PATCH each loser: `duplicate_of_account` = survivor, status Inactive (Needs Review if it has revenue and AR); then bring the survivor to the website name/parent when the SOP allows |
+| `field_drift` | Confirmed match whose CRM zip or care type disagrees with the website | PATCH that one field (low priority) |
 | `chow_out` | Bellhaven account not on the website; another owner has an account at the same address | PATCH `chow_current_account` = that account + note; status and parent unchanged |
 | `not_on_website` | Bellhaven account not on the website; nobody else at that address | PATCH status Needs Review + note |
 | `parent_acquired` | Acquired parent whose children are all reconciled | PATCH status Inactive + note (low priority) |
@@ -287,10 +288,13 @@ Results (against the CRM snapshot captured 2026-10-11, `tests/fixtures/crm`):
 
 - Website locations scraped: 35 (34 in the directory plus Findlay from the homepage).
 - CRM accounts / contacts read: 121 / 67.
-- Proposals: 46. Confirmed 18, rename 7 (3 real renames, 4 cosmetic), reparent 4,
-  chow_reparent 2, duplicate 7, create 4, chow_out 1, not_on_website 2, parent_acquired 1.
-  28 are actionable; applying them all makes 30 API writes (6 creates, 24 patches), and the
-  next run converges to 35 confirmed and nothing else.
+- Proposals: 44. Confirmed 18, rename 7 (3 real renames, 4 cosmetic), reparent 3,
+  chow_reparent 2, duplicate 5 (one per cluster, 12 accounts involved, Kettering flagged as
+  a tie), create 4, chow_out 1, not_on_website 2, parent_acquired 1, field_drift 1
+  (Portsmouth zip 45626 -> 45662). 26 are actionable; applying them all makes 31 API writes
+  (6 creates, 25 patches), and the next run converges to 35 confirmed and nothing else.
+- The demo recording was made before the survivor picker and `field_drift` were added, so
+  its Erie scene shows the earlier one-proposal-per-loser layout.
 - Live CRM copy: see "What happened to the live copy" in the writeup below.
 - Tests: `uv run pytest -q` runs the whole suite offline in about a second; one live smoke
   test is opt-in with `-m live`.
@@ -324,8 +328,8 @@ CRM copy had already been corrected by a separate agent session working from the
 token (its notes are prefixed "[Bellhaven review ...]"). Its outcome agrees with this
 pipeline's on every location, with three differences: it set Sandusky to Needs Review
 instead of pointing it at Millstone, chose a different Kettering survivor (the orphaned
-copy; this pipeline's tie-break would have picked the Harborview copy, which is why the
-tie-break is documented in each proposal), and also fixed Portsmouth's zip and added the
+copy; this pipeline's ordering ranks the Harborview copy first but flags the cluster as a
+tie, which is exactly why the duplicate proposal lets the reviewer pick the survivor), and also fixed Portsmouth's zip and added the
 second care offering to two accounts. This pipeline's first live run therefore produced 35
 confirmed matches and two live proposals for the recorded review: the Sandusky CHOW
 pointer (approving it writes `chow_current_account` to the CRM) and the Harborview
@@ -346,9 +350,9 @@ than trusting the "everything confirmed" summary.
 **What I would build next.** (1) Persist the state db somewhere durable (a `state` branch
 or S3) so reviewer decisions made on a laptop flow back to the scheduled run. (2) A
 "facility identity" table keyed on normalised address so the matcher can carry forward
-survivor choices and CHOW chains across days instead of recomputing them. (3) Proposals
-for field drift on confirmed matches (zip typos, second care offerings, phone) behind a
-separate low-priority tab, since the pipeline already has the evidence. (4) Alerting when
+survivor choices and CHOW chains across days instead of recomputing them. (3) Extend `field_drift`
+to phone numbers and second care offerings once there is a convention for multi-value care
+types; today it covers zip and care-type conflicts only. (4) Alerting when
 the scrape count drops, which is the one failure that could silently turn every account
 into "not on website"; today the run refuses to proceed on an empty scrape but does not
 page anyone.

@@ -15,7 +15,15 @@ from typing import Any, Iterable
 from rapidfuzz import fuzz
 
 from .config import DEFAULT_PARENT_NAME
-from .match import Candidate, LocationMatch, contacts_by_account, explain_survivor, is_parent_like, parent_ids_of
+from .match import (
+    SURVIVOR_CRITERIA,
+    Candidate,
+    LocationMatch,
+    contacts_by_account,
+    is_parent_like,
+    parent_ids_of,
+    survivor_sort_key,
+)
 from .models import (
     NEW_ACCOUNT_REF,
     PRIORITY_ORDER,
@@ -41,6 +49,7 @@ from .normalize import (
 log = logging.getLogger(__name__)
 
 GLOBAL_NAME_COLLISION_RATIO = 85.0  # fuzz.ratio of loose names, for "possibly related" evidence
+NAME_TIE_MARGIN = 5.0  # a survivor decided by a smaller name-similarity gap is reported as a tie
 _PARENT_SUFFIX_RE = re.compile(r"\s*\(parent account\)\s*$", re.IGNORECASE)
 
 
@@ -95,6 +104,29 @@ def _norm_text(text: str) -> str:
     return " ".join(re.sub(r"[^\w\s]", " ", (text or "").lower()).split())
 
 
+def _stamp(today: date) -> str:
+    return f"[bellhaven-sync {today.isoformat()}]"
+
+
+def _note_text(stamp: str, account: Account | None, text: str) -> str:
+    new = f"{stamp} {text}"
+    old = (account.note or "").strip() if account else ""
+    return f"{old} | {new}" if old else new
+
+
+def _patch_action(stamp: str, account: Account, fields: dict[str, Any], note: str, label: str) -> Action | None:
+    """A patch with only the fields that would actually change; None if nothing would."""
+    changes = {k: v for k, v in fields.items() if (getattr(account, k, "") or "") != (v or "")}
+    if not changes:
+        return None
+    changes["note"] = _note_text(stamp, account, note)
+    return Action(op="patch", account_id=account.account_id, fields=changes, label=label)
+
+
+def _parent_label_of(a: Account) -> str:
+    return _PARENT_SUFFIX_RE.sub("", a.parent_name or "").strip() or (a.parent_id or "no parent")
+
+
 class _Builder:
     """Holds the run-wide context so the per-kind functions stay short."""
 
@@ -112,22 +144,22 @@ class _Builder:
         self.bh = bellhaven_parent_id
         self.bh_name = parent_label(self.by_id[bellhaven_parent_id]) if bellhaven_parent_id in self.by_id else "Bellhaven"
         self.about_text = about_text or ""
-        self.stamp = f"[bellhaven-sync {today.isoformat()}]"
+        self.today = today
+        self.stamp = _stamp(today)
         self.parent_ids = parent_ids_of(accounts)
 
     # ------------------------------------------------------------- primitives
     def note(self, account: Account | None, text: str) -> str:
-        new = f"{self.stamp} {text}"
-        old = (account.note or "").strip() if account else ""
-        return f"{old} | {new}" if old else new
+        return _note_text(self.stamp, account, text)
 
     def patch(self, account: Account, fields: dict[str, Any], note: str, label: str) -> Action | None:
         """A patch with only the fields that would actually change; None if nothing would."""
-        changes = {k: v for k, v in fields.items() if (getattr(account, k, "") or "") != (v or "")}
-        if not changes:
-            return None
-        changes["note"] = self.note(account, note)
-        return Action(op="patch", account_id=account.account_id, fields=changes, label=label)
+        return _patch_action(self.stamp, account, fields, note, label)
+
+    def will_be_bellhaven(self, a: Account) -> bool:
+        """Under Bellhaven now, or moved there by this run (reparent / duplicate survivor);
+        False for the CHOW case, where a new account takes the website values instead."""
+        return a.parent_id == self.bh or not a.has_revenue_and_ar
 
     def create(self, site: SiteLocation, note: str, label: str) -> Action:
         care = map_care_type(site.care_offerings[0]) if site.care_offerings else ""
@@ -199,15 +231,16 @@ class _Builder:
                     f"CRM billing street '{a.billing_street}' differs from the website street '{site.street}'; "
                     "matched on other evidence, address not changed (check manually)."
                 )
-        elif normalize_zip(a.billing_zip) != normalize_zip(site.zip):
-            notes.append(f"CRM zip '{a.billing_zip}' differs from the website zip '{site.zip}' (not changed).")
+        drift = "proposed separately as field_drift" if self.will_be_bellhaven(a) else "not changed"
+        if s.street_match and normalize_zip(a.billing_zip) != normalize_zip(site.zip):
+            notes.append(f"CRM zip '{a.billing_zip}' differs from the website zip '{site.zip}' ({drift}).")
         if site.phone and not s.phone_match:
             notes.append(f"CRM phone '{a.phone or '-'}' differs from the website phone '{site.phone}' (not changed).")
         mapped = map_care_types(site.care_offerings)
         if a.care_type and mapped and a.care_type not in mapped:
             notes.append(
                 f"CRM care_type '{a.care_type}' vs website offerings {', '.join(site.care_offerings)} "
-                f"(maps to {', '.join(mapped)}); not changed."
+                f"(maps to {', '.join(mapped)}); {drift}."
             )
         if site.administrator and not s.admin_match:
             names = ", ".join(x.name for x in self.contacts.get(a.account_id, []) if x.is_active) or "no contacts"
@@ -258,7 +291,7 @@ def _matched_proposal(b: _Builder, m: LocationMatch) -> Proposal | None:
     if m.is_duplicate_cluster:
         notes.append(m.survivor_rule)
         notes.append(
-            "Duplicate copies at this address get their own 'duplicate' proposals: "
+            "Duplicate copies at this address are handled by one 'duplicate' group proposal: "
             + ", ".join(f"{l.account.account_id} {l.account.name}" for l in m.losers) + "."
         )
     loser_rows = [(l.account, "loser") for l in m.losers]
@@ -389,53 +422,255 @@ def _matched_proposal(b: _Builder, m: LocationMatch) -> Proposal | None:
     )
 
 
-def _duplicate_proposals(b: _Builder, m: LocationMatch) -> list[Proposal]:
-    site, surv = m.site, m.survivor
-    assert surv is not None
-    out = []
-    for l in m.losers:
-        a = l.account
+def _rank_reason(hi: Candidate, lo: Candidate, bh: str) -> tuple[str, int]:
+    """Short text naming the first survivor criterion that puts `hi` above `lo`, and its index."""
+    kh, kl = survivor_sort_key(hi, bh), survivor_sort_key(lo, bh)
+    for i, (x, y) in enumerate(zip(kh, kl, strict=True)):
+        if x == y:
+            continue
+        crit = SURVIVOR_CRITERIA[i]
+        if crit == "parent is Bellhaven":
+            return "already under Bellhaven", i
+        if crit == "lifetime revenue > 0":
+            return f"has lifetime revenue ({_money(hi.account.lifetime_revenue)})", i
+        if crit == "higher name similarity":
+            return f"name similarity {hi.score.name_similarity:.1f} vs {lo.score.name_similarity:.1f}", i
+        if crit == "more contacts":
+            return f"more contacts ({hi.n_contacts} vs {lo.n_contacts})", i
+        if crit == "lowest account_id":
+            return "tie: lowest account id", i
+        return crit, i  # "website phone matches" / "website administrator is a contact"
+    return "tie: indistinguishable", len(kh) - 1
+
+
+def _is_tie(hi: Candidate, lo: Candidate, bh: str) -> bool:
+    """Nothing substantive separates the two: the ordering fell through to the account-id
+    tiebreak, or was decided by a name-similarity gap below NAME_TIE_MARGIN."""
+    _, i = _rank_reason(hi, lo, bh)
+    crit = SURVIVOR_CRITERIA[i]
+    if crit == "lowest account_id":
+        return True
+    return crit == "higher name similarity" and abs(hi.score.name_similarity - lo.score.name_similarity) < NAME_TIE_MARGIN
+
+
+def build_duplicate_group_actions(
+    evidence: dict[str, Any], survivor_id: str, *, today: date | None = None
+) -> list[Action]:
+    """Actions for a duplicate cluster with `survivor_id` as the surviving account.
+
+    Pure; works from a `duplicate` proposal's evidence alone so the review app can rebuild the
+    actions for the reviewer's chosen survivor. In order: (a) every other candidate points at
+    the survivor and goes Inactive (Needs Review if it has revenue AND open AR); (b) the
+    survivor takes the website name and moves under Bellhaven, unless it has revenue AND open
+    AR outside Bellhaven, in which case only a note is written (CHOW SOP: the next run
+    proposes a chow_reparent for it)."""
+    cluster = evidence["cluster"]
+    site = evidence["site"]
+    bh = cluster["bellhaven_parent_id"]
+    bh_name = cluster.get("bellhaven_parent_name") or "Bellhaven"
+    rows = sorted(cluster["candidates"], key=lambda r: r.get("rank", 0))
+    by_id = {r["account_id"]: r for r in rows}
+    if survivor_id not in by_id:
+        raise ValueError(f"{survivor_id!r} is not a candidate of this duplicate cluster ({', '.join(by_id)})")
+    stamp = _stamp(today or date.today())
+    surv = Account.from_api(by_id[survivor_id])
+    where = f"{site['street']}, {site['city']}"
+    actions: list[Action] = []
+
+    for r in rows:
+        if r["account_id"] == survivor_id:
+            continue
+        a = Account.from_api(r)
         status = "Needs Review" if a.has_revenue_and_ar else "Inactive"
         why_status = (
             f"set to Needs Review (not Inactive) because it has revenue {_money(a.lifetime_revenue)} and open AR "
             f"{_money(a.outstanding_ar)}" if status == "Needs Review" else "set Inactive"
         )
-        action = b.patch(
-            a, {"duplicate_of_account": surv.account.account_id, "status": status},
-            f"Duplicate of {surv.account.account_id} '{surv.account.name}' (same facility at {site.street}, "
-            f"{site.city} on the Bellhaven website); {why_status}. Use the surviving account going forward.",
-            label=f"Mark duplicate of {surv.account.account_id} ({status})",
+        act = _patch_action(
+            stamp, a, {"duplicate_of_account": surv.account_id, "status": status},
+            f"Duplicate of {surv.account_id} '{surv.name}' (same facility at {where} on the Bellhaven website); "
+            f"{why_status}. Use the surviving account going forward.",
+            label=f"Mark '{a.name}' ({a.account_id}) duplicate of {surv.account_id} ({status})",
         )
-        if action is None:
-            continue
-        others = [(x.account, "loser") for x in m.losers if x is not l]
-        notes = [f"Match: {m.rule}", *m.notes, m.survivor_rule]
-        if status == "Needs Review":
-            notes.append("Billing history stays visible: the account is not inactivated while AR is open (SOP).")
-        out.append(
-            Proposal(
-                kind=ProposalKind.DUPLICATE,
-                priority="high",
-                title=f"Duplicate: '{a.name}' ({a.account_id}) -> {surv.account.account_id} '{surv.account.name}'",
-                summary=(
-                    f"{a.account_id} ({a.name}, under {b.parent_display(a)}) is the same facility as survivor "
-                    f"{surv.account.account_id}; point it at the survivor and set it {status}."
-                ),
-                actions=[action],
-                evidence=b.evidence(
-                    site=site, accounts=[(a, "loser"), (surv.account, "survivor"), *others], score=l.score.to_dict(),
-                    rule=(
-                        f"Duplicate cluster at one website address: survivor chosen by ordering "
-                        f"({explain_survivor(surv, l, b.bh)}), every other address match becomes a duplicate."
-                    ),
-                    notes=notes,
-                ),
-                confidence=round(l.score.total / 100.0, 2),
-                subject_account_id=a.account_id,
-                site_slug=site.slug,
+        if act is not None:
+            actions.append(act)
+
+    from_parent = _parent_label_of(surv) if surv.parent_id else "no parent"
+    not_bh = surv.parent_id != bh
+    name_differs = not names_equal_strict(surv.name, site["name"])
+    if not_bh and surv.has_revenue_and_ar:
+        actions.append(
+            Action(
+                op="patch",
+                account_id=surv.account_id,
+                fields={
+                    "note": _note_text(
+                        stamp, surv,
+                        f"Kept as the surviving account of the duplicate cluster at {where}. It has lifetime revenue "
+                        f"{_money(surv.lifetime_revenue)} and open AR {_money(surv.outstanding_ar)} under {from_parent}, "
+                        "so its parent and name are not changed (CHOW SOP); the next sync run proposes a change of "
+                        "ownership (chow_reparent) for it.",
+                    )
+                },
+                label=f"Survivor stays under {from_parent} (CHOW SOP; note only)",
             )
         )
-    return out
+    elif not_bh or name_differs:
+        fields: dict[str, Any] = {}
+        parts: list[str] = []
+        if not_bh:
+            fields["parent_id"] = bh
+            parts.append(f"moved from {from_parent} to {bh_name}" if surv.parent_id else f"linked to parent {bh_name}")
+        if name_differs:
+            fields["name"] = site["name"]
+            parts.append(f"renamed from '{surv.name}' to '{site['name']}'")
+        sop = ""
+        if not_bh:
+            sop = (" No open AR" if not (surv.outstanding_ar or 0) > 0 else " No lifetime revenue") + (
+                ", so the account moves directly (CHOW SOP not needed)."
+            )
+        act = _patch_action(
+            stamp, surv, fields,
+            f"Kept as the surviving account of the duplicate cluster at {where}; {' and '.join(parts)} to match the "
+            f"Bellhaven website ({site.get('source_url', '')}).{sop}",
+            label="Survivor: " + " and ".join(
+                (["move under Bellhaven"] if not_bh else []) + ([f"rename to '{site['name']}'"] if name_differs else [])
+            ),
+        )
+        if act is not None:
+            actions.append(act)
+    return actions
+
+
+def _duplicate_group_proposal(b: _Builder, m: LocationMatch) -> Proposal | None:
+    """One proposal per duplicate cluster; the reviewer may pick another survivor in the app."""
+    site, surv = m.site, m.survivor
+    assert surv is not None and m.is_duplicate_cluster
+    ranked = list(m.matched)  # already in survivor order
+    reasons = [_rank_reason(ranked[0], ranked[1], b.bh)[0]] + [
+        f"below #{k}: {_rank_reason(ranked[k - 1], ranked[k], b.bh)[0]}" for k in range(1, len(ranked))
+    ]
+    tie = _is_tie(ranked[0], ranked[1], b.bh)
+    candidates = [
+        {
+            **c.account.to_dict(),
+            "contacts": [x.to_dict() for x in b.contacts.get(c.account.account_id, [])],
+            "phone_match": c.score.phone_match,
+            "admin_match": c.score.admin_match,
+            "name_similarity": c.score.name_similarity,
+            "rank": k + 1,
+            "rank_reason": reasons[k],
+        }
+        for k, c in enumerate(ranked)
+    ]
+    a = surv.account
+    notes = [f"Match: {m.rule}", *m.notes, m.survivor_rule, *b.difference_notes(site, surv)]
+    if tie:
+        notes.append(
+            f"Tie: nothing substantive separates #1 {a.account_id} and #2 {ranked[1].account.account_id} "
+            f"({reasons[0]}); please choose the survivor deliberately."
+        )
+    for c in ranked[1:]:
+        if c.account.has_revenue_and_ar:
+            notes.append(
+                f"{c.account.account_id} has revenue AND open AR: as a duplicate it goes to Needs Review, not Inactive (SOP)."
+            )
+    if a.parent_id != b.bh and a.has_revenue_and_ar:
+        notes.append(
+            f"Recommended survivor {a.account_id} has revenue AND open AR outside Bellhaven: its parent is not changed "
+            "here; the next run proposes a chow_reparent for it."
+        )
+    evidence = b.evidence(
+        site=site,
+        accounts=[(a, "survivor"), *[(c.account, "loser") for c in ranked[1:]]],
+        score=surv.score.to_dict(),
+        rule=(
+            f"Duplicate cluster: {len(ranked)} CRM accounts match one website address. Survivor ordering "
+            f"({' > '.join(SURVIVOR_CRITERIA)}) recommends {a.account_id}; every other copy becomes its duplicate and "
+            "the survivor takes the website name and Bellhaven parent. The reviewer may choose another survivor."
+        ),
+        notes=notes,
+    )
+    evidence["cluster"] = {
+        "candidates": candidates,
+        "recommended": a.account_id,
+        "tie": tie,
+        "bellhaven_parent_id": b.bh,
+        "bellhaven_parent_name": b.bh_name,
+    }
+    actions = build_duplicate_group_actions(evidence, a.account_id, today=b.today)
+    if not actions:
+        return None
+    return Proposal(
+        kind=ProposalKind.DUPLICATE,
+        priority="high",
+        title=f"Duplicate accounts for '{site.name}': {len(ranked)} copies at {site.street}",
+        summary=(
+            f"{len(ranked)} CRM accounts are the website's {site.name} ({_site_addr(site)}). Recommended survivor: "
+            f"{a.account_id} '{a.name}' ({reasons[0]})"
+            + ("; this is a TIE, nothing substantive separates the top two" if tie else "")
+            + (". The other copy points" if len(ranked) == 2 else f". The other {len(ranked) - 1} copies point")
+            + " at the survivor and are retired; the survivor is aligned with the website."
+        ),
+        actions=actions,
+        evidence=evidence,
+        confidence=round(surv.score.total / 100.0, 2),
+        subject_account_id=a.account_id,
+        site_slug=site.slug,
+    )
+
+
+def _field_drift_proposal(b: _Builder, m: LocationMatch) -> Proposal | None:
+    """billing_zip / care_type corrections for a matched account that is (or will be) under
+    Bellhaven. Never phone or street (recorded in evidence notes only)."""
+    site, c = m.site, m.survivor
+    assert c is not None
+    a = c.account
+    if not b.will_be_bellhaven(a):
+        return None  # CHOW: the new Bellhaven account is created with the website values
+    fields: dict[str, Any] = {}
+    drift: dict[str, Any] = {}
+    changes: list[str] = []
+    if c.score.street_match and normalize_zip(site.zip) and normalize_zip(a.billing_zip) != normalize_zip(site.zip):
+        fields["billing_zip"] = site.zip
+        drift["billing_zip"] = {"crm": a.billing_zip, "website": site.zip}
+        changes.append(f"billing_zip '{a.billing_zip}' -> '{site.zip}'")
+    mapped = map_care_types(site.care_offerings)
+    if a.care_type and mapped and a.care_type not in mapped:
+        fields["care_type"] = mapped[0]
+        drift["care_type"] = {"crm": a.care_type, "website": list(site.care_offerings), "mapped": mapped}
+        changes.append(f"care_type '{a.care_type}' -> '{mapped[0]}'")
+    if not fields:
+        return None
+    action = b.patch(
+        a, fields,
+        f"Corrected from the Bellhaven website ({site.source_url}): {'; '.join(changes)}. "
+        f"Website care offerings: {', '.join(site.care_offerings) or 'none listed'}.",
+        label="Update " + " and ".join(fields) + " from the website",
+    )
+    if action is None:
+        return None
+    notes = [f"Match: {m.rule}", *(f"CRM {k} {v['crm']!r} vs website {v['website']!r}." for k, v in drift.items())]
+    if site.phone and not c.score.phone_match:
+        notes.append(f"CRM phone '{a.phone or '-'}' differs from the website phone '{site.phone}' (not changed).")
+    evidence = b.evidence(
+        site=site, accounts=[(a, "subject")], score=c.score.to_dict(),
+        rule="Matched account is (or will be) under Bellhaven and the CRM billing_zip (same street) or care_type "
+        "disagrees with the website: patch only those fields. Phone and street are never changed.",
+        notes=notes,
+    )
+    evidence["drift"] = drift
+    return Proposal(
+        kind=ProposalKind.FIELD_DRIFT,
+        priority="low",
+        title=f"Field drift: '{a.name}' " + "; ".join(changes),
+        summary=f"{a.account_id} matches the website's {site.name} but its CRM {' and '.join(drift)} disagrees with the website.",
+        actions=[action],
+        evidence=evidence,
+        confidence=round(c.score.total / 100.0, 2),
+        subject_account_id=a.account_id,
+        site_slug=site.slug,
+    )
 
 
 def _create_proposal(b: _Builder, m: LocationMatch) -> Proposal:
@@ -681,11 +916,22 @@ def build_proposals(
                 f"duplicate of {m.survivor.account.account_id} at website location '{m.site.slug}'"
             )
         p = _matched_proposal(b, m)
+        if m.is_duplicate_cluster:
+            surv = m.survivor.account
+            if surv.parent_id != b.bh and surv.has_revenue_and_ar:
+                chow_retained.add(surv.account_id)  # proposed as chow_reparent once the group is applied
+            if p is not None and p.kind != ProposalKind.CONFIRMED:
+                p = None  # the survivor's rename/reparent lives inside the duplicate group proposal
+            g = _duplicate_group_proposal(b, m)
+            if g is not None:
+                proposals.append(g)
         if p is not None:
             proposals.append(p)
             if p.kind == ProposalKind.CHOW_REPARENT and p.subject_account_id:
                 chow_retained.add(p.subject_account_id)
-        proposals.extend(_duplicate_proposals(b, m))
+        d = _field_drift_proposal(b, m)
+        if d is not None:
+            proposals.append(d)
 
     proposals.extend(_crm_only_proposals(b, matched_ids))
     proposals.extend(_parent_acquired_proposals(b, matched_ids, chow_retained, match_roles))

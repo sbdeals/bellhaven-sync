@@ -161,7 +161,7 @@ def test_pipeline_over_snapshot_matches_fake_crm(settings, state, fake_crm) -> N
     fetch = fixture_fetcher(SITE_DIR)
     snap = run(settings, crm=SnapshotCRM(CRM_DIR, state_path=state), store=Store(), fetch=fetch, today=TODAY)
     fake = run(settings, crm=fake_crm, store=Store(), fetch=fetch, today=TODAY)
-    assert len(snap.proposals) == 46
+    assert len(snap.proposals) == 44
     assert {p.fingerprint for p in snap.proposals} == {p.fingerprint for p in fake.proposals}
     assert not state.exists()
 
@@ -191,8 +191,8 @@ def test_cli_run_snapshot(tmp_path, capsys) -> None:
     db = tmp_path / "x.db"
     assert cli.main(["run", "--snapshot", str(CRM_DIR), "--db", str(db)]) == 0
     out = capsys.readouterr().out
-    assert "SNAPSHOT MODE" in out and "46 proposals" in out and "new=46" in out
-    assert Store(db).counts() == {"pending": 46}
+    assert "SNAPSHOT MODE" in out and "44 proposals" in out and "new=44" in out
+    assert Store(db).counts() == {"pending": 44}
     assert not (tmp_path / "snapshot_state.json").exists()  # run never writes to the (snapshot) CRM
 
 

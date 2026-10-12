@@ -12,7 +12,7 @@ from bs4 import BeautifulSoup
 
 from bellhaven_sync.match import match_all
 from bellhaven_sync.models import NEW_ACCOUNT_REF, Account, Proposal, ProposalKind
-from bellhaven_sync.proposals import build_proposals, resolve_parent_id
+from bellhaven_sync.proposals import build_duplicate_group_actions, build_proposals, resolve_parent_id
 from tests.conftest import (
     BELLHAVEN_PARENT_ID,
     CEDAR_TRAIL_PARENT_ID,
@@ -55,13 +55,26 @@ def proposals(site_locations, crm_accounts, crm_contacts, about_text) -> list[Pr
     return _build(site_locations, crm_accounts, crm_contacts, about_text)
 
 
+_SECONDARY = (ProposalKind.CONFIRMED, ProposalKind.FIELD_DRIFT)  # may share a subject with another proposal
+
+
 def _by_subject(props: list[Proposal]) -> dict[str, Proposal]:
+    """subject -> its main proposal: at most one actionable (non-confirmed, non-drift) proposal
+    per subject; confirmed/field_drift only show up when nothing else is proposed for it."""
     out: dict[str, Proposal] = {}
-    for p in props:
+    for p in sorted(props, key=lambda p: p.kind in _SECONDARY):
         if p.subject_account_id:
+            if p.kind in _SECONDARY:
+                out.setdefault(p.subject_account_id, p)
+                continue
             assert p.subject_account_id not in out, f"two proposals for {p.subject_account_id}"
             out[p.subject_account_id] = p
     return out
+
+
+def _group(props: list[Proposal], slug: str) -> Proposal:
+    (p,) = _for_slug(props, slug, ProposalKind.DUPLICATE)
+    return p
 
 
 def _of_kind(props: list[Proposal], kind: ProposalKind) -> list[Proposal]:
@@ -96,7 +109,7 @@ EXPECTED_SITE_KINDS: dict[str, list[str]] = {
     "bellhaven-at-union-square": ["create"],
     "bellhaven-court-of-altoona": ["confirmed"],
     "bellhaven-crossings-of-lima": ["reparent"],
-    "bellhaven-gardens-of-monroe": ["confirmed", "duplicate", "duplicate"],
+    "bellhaven-gardens-of-monroe": ["confirmed", "duplicate"],  # one group proposal per cluster
     "bellhaven-healthcare-centre-of-ashland": ["rename"],
     "bellhaven-meadows-of-findlay": ["reparent"],
     "bellhaven-of-ashtabula": ["confirmed"],
@@ -107,7 +120,7 @@ EXPECTED_SITE_KINDS: dict[str, list[str]] = {
     "bellhaven-of-defiance": ["confirmed"],
     "bellhaven-of-goshen": ["confirmed"],
     "bellhaven-of-kalamazoo": ["confirmed"],
-    "bellhaven-of-kettering": ["duplicate", "duplicate", "reparent"],
+    "bellhaven-of-kettering": ["duplicate"],  # survivor rename+reparent lives inside the group
     "bellhaven-of-maplewood": ["confirmed"],
     "bellhaven-of-marietta": ["chow_reparent"],
     "bellhaven-of-marion": ["confirmed"],
@@ -115,7 +128,7 @@ EXPECTED_SITE_KINDS: dict[str, list[str]] = {
     "bellhaven-of-new-carlisle": ["confirmed"],
     "bellhaven-of-owosso": ["confirmed", "duplicate"],
     "bellhaven-of-port-clinton": ["confirmed", "duplicate"],
-    "bellhaven-of-portsmouth": ["confirmed"],
+    "bellhaven-of-portsmouth": ["confirmed", "field_drift"],  # CRM zip 45626 vs website 45662
     "bellhaven-of-saline": ["confirmed"],
     "bellhaven-of-tiffin": ["chow_reparent"],
     "bellhaven-of-wooster": ["confirmed"],
@@ -159,9 +172,10 @@ def test_kind_counts(proposals) -> None:
     for p in proposals:
         counts[str(p.kind)] = counts.get(str(p.kind), 0) + 1
     assert counts == {
-        "confirmed": 18, "rename": 7, "reparent": 4, "chow_reparent": 2, "duplicate": 7,
-        "create": 4, "chow_out": 1, "not_on_website": 2, "parent_acquired": 1,
+        "confirmed": 18, "rename": 7, "reparent": 3, "chow_reparent": 2, "duplicate": 5,
+        "create": 4, "chow_out": 1, "not_on_website": 2, "parent_acquired": 1, "field_drift": 1,
     }
+    assert len(proposals) == 44
 
 
 # ------------------------------------------------------------------ confirmed
@@ -213,7 +227,6 @@ def test_renames(proposals, slug, account_id, new_name, priority) -> None:
         ("bellhaven-meadows-of-findlay", "001UKEFGADQ8YCZ4YM", {"parent_id": BH}),
         ("bellhaven-crossings-of-lima", "001LGFPBJY4N9MB6KL", {"parent_id": BH}),
         ("bellhaven-of-zanesville", "001H1JMVZWP46D5VUF", {"parent_id": BH, "name": "Bellhaven of Zanesville"}),
-        ("bellhaven-of-kettering", KETTERING_SURVIVOR, {"parent_id": BH, "name": "Bellhaven of Kettering"}),
     ],
 )
 def test_reparents(proposals, slug, account_id, fields) -> None:
@@ -225,11 +238,12 @@ def test_reparents(proposals, slug, account_id, fields) -> None:
 
 
 def test_kettering_survivor_rule_is_documented(proposals) -> None:
-    (p,) = _for_slug(proposals, "bellhaven-of-kettering", ProposalKind.REPARENT)
+    p = _group(proposals, "bellhaven-of-kettering")
     assert any("name similarity" in n for n in p.evidence["notes"])
     roles = {a["account_id"]: a["role"] for a in p.evidence["crm_accounts"]}
-    assert roles[KETTERING_SURVIVOR] == "subject"
+    assert roles[KETTERING_SURVIVOR] == "survivor"
     assert {aid for aid, r in roles.items() if r == "loser"} == KETTERING_LOSERS
+    assert not _for_slug(proposals, "bellhaven-of-kettering", ProposalKind.REPARENT)  # folded into the group
 
 
 # ----------------------------------------------------------------- SOP (CHOW)
@@ -269,33 +283,136 @@ EXPECTED_LOSERS = {
 }
 
 
-def test_duplicates(proposals) -> None:
+EXPECTED_GROUPS = {  # website slug -> (recommended survivor, tie)
+    "bellhaven-gardens-of-monroe": ("001U1750VLVJAGG1S5", False),
+    "bellhaven-shores-of-erie": ("001CVBBCSDM7YHN220", False),
+    "bellhaven-of-port-clinton": ("001UELXDAKFRKB8932", False),
+    "bellhaven-of-owosso": ("001EGU7BMJ942ZTRE6", False),
+    "bellhaven-of-kettering": (KETTERING_SURVIVOR, True),
+}
+
+
+def test_duplicates_one_group_per_cluster(proposals) -> None:
     dups = _of_kind(proposals, ProposalKind.DUPLICATE)
-    assert {p.subject_account_id: p.actions[0].fields["duplicate_of_account"] for p in dups} == EXPECTED_LOSERS
+    assert {p.site_slug: (p.subject_account_id, p.evidence["cluster"]["tie"]) for p in dups} == EXPECTED_GROUPS
+    loser_patches = {
+        a.account_id: a.fields["duplicate_of_account"] for p in dups for a in p.actions if "duplicate_of_account" in a.fields
+    }
+    assert loser_patches == EXPECTED_LOSERS
     for p in dups:
-        assert p.priority == "high"
-        (a,) = p.actions
-        assert a.account_id == p.subject_account_id
-        assert a.fields["status"] == "Inactive" and set(a.fields) == {"duplicate_of_account", "status", "note"}
+        cl = p.evidence["cluster"]
+        assert p.priority == "high" and cl["recommended"] == p.subject_account_id and cl["bellhaven_parent_id"] == BH
+        assert [c["rank"] for c in cl["candidates"]] == list(range(1, len(cl["candidates"]) + 1))
+        assert cl["candidates"][0]["account_id"] == p.subject_account_id
+        for c in cl["candidates"]:
+            assert c["rank_reason"] and isinstance(c["contacts"], list)
+            assert {"phone_match", "admin_match", "name_similarity", "parent_id", "lifetime_revenue"} <= set(c)
         roles = {x["account_id"]: x["role"] for x in p.evidence["crm_accounts"]}
-        assert roles[p.subject_account_id] == "loser"
-        assert roles[EXPECTED_LOSERS[p.subject_account_id]] == "survivor"
+        assert roles[p.subject_account_id] == "survivor"
+        assert {aid for aid, r in roles.items() if r == "loser"} == {c["account_id"] for c in cl["candidates"][1:]}
         assert "survivor" in p.evidence["rule"].lower()
+        losers = [a for a in p.actions if a.account_id != p.subject_account_id]
+        assert [a.account_id for a in losers] == [c["account_id"] for c in cl["candidates"][1:]]
+        for a in losers:
+            assert a.fields["status"] == "Inactive" and set(a.fields) == {"duplicate_of_account", "status", "note"}
+        # stored actions are exactly the recommended-survivor build
+        rebuilt = build_duplicate_group_actions(p.evidence, p.subject_account_id, today=TODAY)
+        assert [x.to_dict() for x in rebuilt] == [x.to_dict() for x in p.actions]
 
 
-def test_kettering_duplicate_rule_names_tiebreak(proposals) -> None:
-    for p in _of_kind(proposals, ProposalKind.DUPLICATE):
-        if p.subject_account_id in KETTERING_LOSERS:
-            assert "name similarity" in p.evidence["rule"]
+def test_kettering_group_is_a_tie_with_survivor_rename_and_reparent(proposals) -> None:
+    p = _group(proposals, "bellhaven-of-kettering")
+    cl = p.evidence["cluster"]
+    assert cl["tie"] is True and len(cl["candidates"]) == 3
+    assert p.title == "Duplicate accounts for 'Bellhaven of Kettering': 3 copies at 3313 Wilmington Pike"
+    assert cl["candidates"][0]["rank_reason"] == "name similarity 65.0 vs 64.3"
+    assert cl["candidates"][2]["rank_reason"].endswith("tie: lowest account id")
+    *losers, survivor = p.actions
+    assert {a.account_id for a in losers} == KETTERING_LOSERS
+    assert survivor.account_id == KETTERING_SURVIVOR
+    assert {k: v for k, v in survivor.fields.items() if k != "note"} == {"parent_id": BH, "name": "Bellhaven of Kettering"}
+
+
+def test_owosso_group_recommends_phone_and_admin_match(proposals) -> None:
+    p = _group(proposals, "bellhaven-of-owosso")
+    cl = p.evidence["cluster"]
+    top = cl["candidates"][0]
+    assert cl["recommended"] == "001EGU7BMJ942ZTRE6" == top["account_id"] and cl["tie"] is False
+    assert top["phone_match"] is True and top["admin_match"] is True
+    assert top["rank_reason"] == "website phone matches"
+    assert [a.account_id for a in p.actions] == ["001QU150PM4Z15UA71"]  # survivor already right: no survivor patch
+
+
+def test_group_actions_for_non_recommended_survivor(proposals) -> None:
+    p = _group(proposals, "bellhaven-of-kettering")
+    alt = "001B7XZAA3AFALS9GP"
+    actions = build_duplicate_group_actions(p.evidence, alt, today=TODAY)
+    *losers, survivor = actions
+    assert len(losers) == 2
+    assert {a.account_id for a in losers} == {KETTERING_SURVIVOR, "0016KTS1UAWBRXS09J"}
+    for a in losers:
+        assert a.fields["duplicate_of_account"] == alt and a.fields["status"] == "Inactive"
+        assert STAMP in a.fields["note"] and alt in a.fields["note"]
+    assert survivor.account_id == alt
+    assert {k: v for k, v in survivor.fields.items() if k != "note"} == {"parent_id": BH, "name": "Bellhaven of Kettering"}
+    assert STAMP in survivor.fields["note"]
+    with pytest.raises(ValueError):
+        build_duplicate_group_actions(p.evidence, "001NOTACANDIDATE", today=TODAY)
+
+
+def test_group_survivor_with_revenue_and_ar_outside_bellhaven_keeps_parent(site_locations, crm_accounts, crm_contacts, about_text) -> None:
+    accts = _patched(crm_accounts, KETTERING_SURVIVOR, lifetime_revenue=5000, outstanding_ar=250)
+    props = _build(site_locations, accts, crm_contacts, about_text)
+    assert [str(p.kind) for p in _for_slug(props, "bellhaven-of-kettering")] == ["duplicate"]  # no separate chow
+    p = _group(props, "bellhaven-of-kettering")
+    assert p.subject_account_id == KETTERING_SURVIVOR and p.evidence["cluster"]["tie"] is False
+    survivor = p.actions[-1]
+    assert survivor.account_id == KETTERING_SURVIVOR and set(survivor.fields) == {"note"}
+    assert "chow_reparent" in survivor.fields["note"]
 
 
 def test_duplicate_loser_with_revenue_and_ar_goes_to_needs_review(site_locations, crm_accounts, crm_contacts, about_text) -> None:
     accts = _patched(crm_accounts, "001JD2MWRA74LTSN24", lifetime_revenue=5000, outstanding_ar=250)
-    props = _by_subject(_build(site_locations, accts, crm_contacts, about_text))
-    p = props["001JD2MWRA74LTSN24"]
-    assert p.kind == ProposalKind.DUPLICATE
-    assert p.actions[0].fields["status"] == "Needs Review"
-    assert p.actions[0].fields["duplicate_of_account"] == "001UELXDAKFRKB8932"
+    p = _group(_build(site_locations, accts, crm_contacts, about_text), "bellhaven-of-port-clinton")
+    (a,) = [a for a in p.actions if a.account_id == "001JD2MWRA74LTSN24"]
+    assert a.fields["status"] == "Needs Review"
+    assert a.fields["duplicate_of_account"] == "001UELXDAKFRKB8932"
+
+
+# ----------------------------------------------------------------- field drift
+
+
+def test_portsmouth_zip_drift(proposals) -> None:
+    (d,) = _of_kind(proposals, ProposalKind.FIELD_DRIFT)
+    assert d.site_slug == "bellhaven-of-portsmouth" and d.subject_account_id == "001CF3LDWVRGL09P4F"
+    assert d.priority == "low"
+    (a,) = d.actions
+    assert a.op == "patch" and a.account_id == "001CF3LDWVRGL09P4F"
+    assert {k: v for k, v in a.fields.items() if k != "note"} == {"billing_zip": "45662"}
+    assert STAMP in a.fields["note"]
+    assert d.evidence["drift"] == {"billing_zip": {"crm": "45626", "website": "45662"}}
+    assert _for_slug(proposals, "bellhaven-of-portsmouth", ProposalKind.CONFIRMED)  # still confirmed too
+
+
+def test_drift_is_idempotent(site_locations, crm_accounts, crm_contacts, about_text) -> None:
+    accts = _patched(crm_accounts, "001CF3LDWVRGL09P4F", billing_zip="45662")  # CRM already has the value
+    assert not _of_kind(_build(site_locations, accts, crm_contacts, about_text), ProposalKind.FIELD_DRIFT)
+
+
+def test_care_type_drift(proposals, site_locations, crm_accounts, crm_contacts, about_text) -> None:
+    from bellhaven_sync.normalize import map_care_types
+
+    slug = "bellhaven-of-defiance"
+    site = next(s for s in site_locations if s.slug == slug)
+    (confirmed,) = _for_slug(proposals, slug, ProposalKind.CONFIRMED)
+    mapped = map_care_types(site.care_offerings)
+    wrong = next(c for c in ("Memory Care", "Independent Living", "Skilled Nursing", "Assisted Living") if c not in mapped)
+    props = _build(site_locations, _patched(crm_accounts, confirmed.subject_account_id, care_type=wrong), crm_contacts, about_text)
+    (d,) = _for_slug(props, slug, ProposalKind.FIELD_DRIFT)
+    (a,) = d.actions
+    assert a.account_id == confirmed.subject_account_id
+    assert set(a.fields) == {"care_type", "note"} and a.fields["care_type"] == mapped[0]
+    assert d.evidence["drift"]["care_type"]["crm"] == wrong and d.priority == "low"
 
 
 # --------------------------------------------------------------------- creates
@@ -435,7 +552,9 @@ def test_every_write_has_a_stamped_note_and_label(proposals) -> None:
             assert a.label
             assert STAMP in a.fields["note"]
             assert set(a.fields) <= MUTABLE
-            if a.op == "patch":
+            if a.op == "patch" and p.kind == ProposalKind.FIELD_DRIFT:
+                assert a.account_id and set(a.fields) <= {"billing_zip", "care_type", "note"}  # never phone/street
+            elif a.op == "patch":
                 assert a.account_id and set(a.fields) <= PATCH_ALLOWED  # never care_type/phone/address
             else:
                 assert set(a.fields) == CREATE_FIELDS

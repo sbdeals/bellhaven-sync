@@ -38,6 +38,17 @@ Then open http://127.0.0.1:8000.
 | `bellhaven-sync status` | Proposal counts by status and recent runs. |
 | `bellhaven-sync review` | Local review app on 127.0.0.1:8000. The only path that writes to the CRM. |
 
+**Snapshot / replay mode.** Every command also accepts `--snapshot DIR` to run against a
+captured CRM (`DIR/accounts.json`, `DIR/contacts.json`) and the captured website in
+`DIR/../site`. `tests/fixtures/crm` is the sandbox as it was on 2026-10-11, before any
+correction, so this replays the full day-one queue. Approvals in this mode write only to
+`data/snapshot_state.json`, never to the live CRM. See `docs/DEMO.md`.
+
+```bash
+uv run bellhaven-sync run --snapshot tests/fixtures/crm
+uv run bellhaven-sync review --snapshot tests/fixtures/crm
+```
+
 Configuration comes from environment variables; a `.env` file at the project root is read
 automatically and never overrides variables that are already set.
 
@@ -316,8 +327,9 @@ instead of pointing it at Millstone, chose a different Kettering survivor (the o
 copy; this pipeline's tie-break would have picked the Harborview copy, which is why the
 tie-break is documented in each proposal), and also fixed Portsmouth's zip and added the
 second care offering to two accounts. This pipeline's first live run therefore produced 35
-confirmed matches and left two live proposals in the queue: the Sandusky CHOW pointer
-(approved, it lands in the CRM) and the Harborview parent (reviewer's call). That is also
+confirmed matches and two live proposals for the recorded review: the Sandusky CHOW
+pointer (approving it writes `chow_current_account` to the CRM) and the Harborview
+parent (reviewer's call). That is also
 the convergence property the design relies on: once the CRM is right, a run proposes
 nothing. The full day-one queue can be replayed at any time with `--snapshot`.
 

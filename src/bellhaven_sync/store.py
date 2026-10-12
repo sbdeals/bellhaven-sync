@@ -58,6 +58,10 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+class PartiallyAppliedError(RuntimeError):
+    """Raised when reopening a proposal whose previous apply already created an account."""
+
+
 @dataclass
 class StoredProposal:
     proposal: Proposal
@@ -247,7 +251,20 @@ class Store:
         self.conn.commit()
 
     def reopen(self, fingerprint: str) -> None:
-        """Put a rejected/failed proposal back in the queue (explicit reviewer action)."""
+        """Put a rejected/failed proposal back in the queue (explicit reviewer action).
+
+        Refuses when a failed apply already created an account: re-running the actions
+        would create a second copy. Patches are idempotent, so partial patch failures
+        are safe to retry."""
+        row = self.conn.execute("SELECT apply_result_json FROM proposals WHERE fingerprint=?", (fingerprint,)).fetchone()
+        if row and row["apply_result_json"]:
+            result = json.loads(row["apply_result_json"])
+            created = result.get("created_account_id") if isinstance(result, dict) else None
+            if created:
+                raise PartiallyAppliedError(
+                    f"account {created} was already created by a previous attempt; "
+                    "finish the remaining steps manually in the CRM instead of reopening"
+                )
         self.conn.execute(
             "UPDATE proposals SET status='pending', decided_at=NULL, decided_by=NULL, reviewer_note=NULL, applied_at=NULL, apply_result_json=NULL WHERE fingerprint=?",
             (fingerprint,),

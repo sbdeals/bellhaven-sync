@@ -122,6 +122,26 @@ def test_list_sorts_by_priority_and_filters():
     assert st.get(high.fingerprint).status == "pending"
 
 
+def test_reopen_refused_after_partial_create():
+    import pytest
+
+    from bellhaven_sync.store import PartiallyAppliedError
+
+    st = Store(":memory:")
+    r = st.start_run()
+    st.upsert_proposals([_chow(), _rename()], r)
+    st.decide(_chow().fingerprint, "approved", by="x")
+    st.mark_failed(_chow().fingerprint, {"ok": False, "created_account_id": "001NEW1", "steps": [{"op": "create", "ok": True}, {"op": "patch", "ok": False}]})
+    with pytest.raises(PartiallyAppliedError):
+        st.reopen(_chow().fingerprint)
+    assert st.get(_chow().fingerprint).status == "failed"
+    # a failed patch-only apply is safe to reopen
+    st.decide(_rename().fingerprint, "approved", by="x")
+    st.mark_failed(_rename().fingerprint, {"ok": False, "created_account_id": None, "steps": [{"op": "patch", "ok": False}]})
+    st.reopen(_rename().fingerprint)
+    assert st.get(_rename().fingerprint).status == "pending"
+
+
 def test_runs_recorded(tmp_path):
     st = Store(tmp_path / "x.db")
     r = st.start_run()

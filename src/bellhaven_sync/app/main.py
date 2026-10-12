@@ -25,7 +25,7 @@ from ..apply import ApplyResult, apply_proposal
 from ..config import Settings
 from ..crm import CRM
 from ..models import NEW_ACCOUNT_REF, Proposal
-from ..store import Store, StoredProposal
+from ..store import PartiallyAppliedError, Store, StoredProposal
 
 log = logging.getLogger(__name__)
 
@@ -764,7 +764,11 @@ def create_app(settings: Settings, store: Store, crm: CRM) -> FastAPI:
                 return conflict(sp, "reopened")
             if isinstance(sp.apply_result, dict) and any(s.get("ok") for s in sp.apply_result.get("steps") or []):
                 log.warning("reopening %s although some of its steps were already applied: %s", fingerprint[:12], sp.apply_result)
-            store.reopen(fingerprint)
+            try:
+                store.reopen(fingerprint)
+            except PartiallyAppliedError as exc:
+                flash = {"level": "warn", "text": f"Not reopened: {exc}. Nothing was written to the CRM."}
+                return render_detail(sp, flash=flash, status_code=409)
         return RedirectResponse(f"/proposals/{fingerprint}?msg=reopened", status_code=303)
 
     @app.get("/runs", response_class=HTMLResponse)

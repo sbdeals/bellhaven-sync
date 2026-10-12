@@ -1,0 +1,20 @@
+{% macro cell(c) -%}
+{% if c.entries %}
+<ul class="contacts">
+  {% for it in c.entries %}<li class="{{ it.cls }}">{{ it.text }}{% if it.sub %} <span class="muted">· {{ it.sub }}</span>{% endif %}</li>{% endfor %}
+</ul>
+{% elif c.link %}
+<a href="{{ c.link }}" target="_blank" rel="noopener" class="{{ 'mono' if c.mono else '' }}">{{ c.text }}</a>{% if c.sub %}<div class="sub">{{ c.sub }}</div>{% endif %}
+{% elif c.text %}
+<span class="{{ 'muted' if c.muted else '' }}">{{ c.text }}</span>{% if c.sub %}<div class="sub">{{ c.sub }}</div>{% endif %}
+{% else %}
+<span class="muted">—</span>
+{% endif %}
+{%- endmacro %}
+
+{% macro value(v) -%}
+{% if v.is_ref %}<span class="ref">{{ "the newly created account" }}</span>
+{% elif v.id %}{% if v.link %}<a href="{{ v.link }}" target="_blank" rel="noopener" class="mono">{{ v.id }}</a>{% else %}<span class="mono">{{ v.id }}</span>{% endif %}{% if v.sub %} <span class="muted">({{ v.sub }})</span>{% endif %}
+{% else %}{% for part in v.parts %}{{ part }}{% if not loop.last %}<span class="ref">the newly created account</span>{% endif %}{% endfor %}
+{% endif %}
+{%- endmacro %}

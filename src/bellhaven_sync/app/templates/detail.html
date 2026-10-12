@@ -1,0 +1,200 @@
+{% extends "base.html" %}
+{% import "_macros.html" as m %}
+{% block title %}{{ p.title }} · {{ app_name }}{% endblock %}
+{% block content %}
+<section class="detail-head">
+  <div class="dh-main">
+    <div class="badges">
+      <span class="badge prio prio-{{ row.priority }}">{{ row.priority }}</span>
+      <span class="badge kind kind-{{ row.kind }}">{{ row.kind_label }}</span>
+      <span class="badge status status-{{ sp.status }}">{{ sp.status }}</span>
+      <span class="muted small">confidence {{ '%.0f'|format((p.confidence or 0) * 100) }}% · seen in runs {{ sp.first_seen_run }}–{{ sp.last_seen_run }} · <span class="mono" title="{{ p.fingerprint }}">{{ p.fingerprint[:12] }}</span></span>
+    </div>
+    <h1>{{ p.title }}</h1>
+    <p class="summary">{{ p.summary }}</p>
+    {% if rule %}<p class="rule"><span class="rule-tag">Rule</span> {{ rule }}</p>{% endif %}
+  </div>
+
+  <div class="dh-decision">
+    {% if approvable %}
+    <form method="post" class="decision-form">
+      <textarea name="note" rows="2" placeholder="Optional reviewer note (saved with the decision)"></textarea>
+      <input type="hidden" name="back" value="{{ sp.status }}">
+      <div class="decision-buttons">
+        <button type="submit" formaction="/proposals/{{ p.fingerprint }}/approve" class="btn btn-approve btn-xl" data-confirm="{{ row.confirm }}">✓ Approve &amp; apply</button>
+        <button type="submit" formaction="/proposals/{{ p.fingerprint }}/reject" class="btn btn-reject btn-xl">✕ Reject</button>
+      </div>
+      <div class="muted small">Approve makes {{ actions|length }} CRM write{{ '' if actions|length == 1 else 's' }}, in the order shown.</div>
+    </form>
+    {% elif row.kind == 'confirmed' %}
+    <div class="decided decided-info">
+      <div class="decided-status">No change needed</div>
+      <div class="muted">The website and the CRM agree. Shown for information only.</div>
+    </div>
+    {% else %}
+    <div class="decided decided-{{ sp.status }}">
+      <div class="decided-status">{{ sp.status|capitalize }}</div>
+      <div class="muted">by {{ sp.decided_by or '—' }} · {{ sp.decided_at|ts }}{% if sp.applied_at %} · {{ 'attempted' if sp.status == 'failed' else 'applied' }} {{ sp.applied_at|ts }}{% endif %}</div>
+      {% if sp.reviewer_note %}<div class="reviewer-note">“{{ sp.reviewer_note }}”</div>{% endif %}
+      {% if reopenable %}
+      <form method="post" action="/proposals/{{ p.fingerprint }}/reopen">
+        <button type="submit" class="btn btn-secondary"
+          data-confirm="{% if result and result.partial %}WARNING: {{ result.ok_count }} of {{ result.total }} step(s) were already written to the CRM{% if result.created %} (including new account {{ result.created }}){% endif %}. Approving again re-runs ALL actions.{% else %}Put this proposal back in the pending queue?{% endif %}">Reopen</button>
+      </form>
+      {% endif %}
+    </div>
+    {% endif %}
+  </div>
+</section>
+
+{% if sp.status == 'stale' %}
+<div class="flash flash-warn"><strong>Stale:</strong> the latest pipeline run no longer produced this proposal, so the CRM or the website may have changed since. Consider re-running the pipeline before approving.</div>
+{% endif %}
+
+<div class="detail-grid">
+  <div class="col-main">
+    <section class="card">
+      <h2>{{ 'Website vs CRM' if cmp.has_site else 'CRM accounts' }}{% if not cmp.has_site %} <span class="badge status status-stale">not on the website</span>{% endif %}</h2>
+      {% if cmp.parents %}
+      <p class="parents small">Parent account{{ 's' if cmp.parents|length > 1 else '' }} involved:
+        {% for a in cmp.parents %}<a href="{{ a.link }}" target="_blank" rel="noopener">{{ a.name }} ↗</a> <span class="mono muted">{{ a.account_id }}</span>{{ ' · ' if not loop.last else '' }}{% endfor %}
+      </p>
+      {% endif %}
+      <div class="table-wrap">
+        <table class="compare">
+          <thead>
+            <tr>
+              <th class="rowlabel"></th>
+              {% for c in cmp.columns %}
+              <th class="col-{{ c.kind }} role-{{ c.role or 'site' }}">
+                <div class="colrole">{{ c.role_label }}</div>
+                <div class="colname">{% if c.link %}<a href="{{ c.link }}" target="_blank" rel="noopener">{{ c.name }} ↗</a>{% else %}{{ c.name }}{% endif %}</div>
+                {% if c.account_id %}<div class="mono small muted">{{ c.account_id }}</div>{% endif %}
+              </th>
+              {% endfor %}
+            </tr>
+          </thead>
+          <tbody>
+            {% for r in cmp.rows %}
+            <tr class="{{ 'sop-row' if r.sop and sop else '' }}">
+              <th class="rowlabel">{{ r.label }}</th>
+              {% for c in r.cells %}<td class="cell {{ c.cls }}{{ ' site-cell' if loop.first and cmp.has_site else '' }}{{ ' has-entries' if c.entries else '' }}">{{ m.cell(c) }}</td>{% endfor %}
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% if cmp.has_site %}
+      <div class="legend"><span class="sw diff"></span>differs from the website <span class="sw same"></span>matches <span class="sw sop"></span>revenue AND open AR (SOP) <span class="sw warn"></span>needs attention</div>
+      {% endif %}
+    </section>
+
+    <div class="card-row">
+      {% if score %}
+      <section class="card">
+        <h2>Match score <span class="score-total">{{ score.total }}</span><span class="muted">/100</span></h2>
+        <table class="score">
+          {% for c in score.components %}
+          <tr><th>{{ c.label }}</th><td class="bar"><span style="width: {{ c.pct }}%"></span></td><td class="pts">{{ c.points }}<span class="muted">/{{ c.max }}</span></td></tr>
+          {% endfor %}
+        </table>
+        <div class="flags">
+          {% for f in score.flags %}<span class="flagchip {{ f.cls }}">{{ '✓' if f.value else '✗' }} {{ f.label }}</span>{% endfor %}
+          {% if score.name_similarity %}<span class="flagchip">name similarity {{ score.name_similarity }}</span>{% endif %}
+          {% if score.address_differs %}<span class="flagchip warn">address differs (kept as is)</span>{% endif %}
+        </div>
+      </section>
+      {% endif %}
+      {% if notes or about_text or ev.site %}
+      <section class="card">
+        <h2>Why</h2>
+        {% if notes %}<ul class="notes">{% for n in notes %}<li>{{ n }}</li>{% endfor %}</ul>{% endif %}
+        {% if about_text %}<blockquote class="about">{{ about_text }}<cite>— website About page</cite></blockquote>{% endif %}
+        {% if site and site.source_url %}<p class="small"><a href="{{ site.source_url }}" target="_blank" rel="noopener">Website page ↗</a>{% if not site.listed_in_directory %} <span class="badge status status-stale">homepage only</span>{% endif %}</p>{% endif %}
+      </section>
+      {% endif %}
+    </div>
+  </div>
+
+  <aside class="col-side">
+    {% if result %}
+    <section class="card result {{ 'result-ok' if result.ok else 'result-bad' }}">
+      <h2>{{ 'Applied to the CRM' if result.ok else 'Apply failed' }} <span class="muted">{{ result.ok_count }}/{{ result.total }} steps</span></h2>
+      {% if result.created %}
+      <div class="created">New account created: <a href="{{ result.created_link }}" target="_blank" rel="noopener" class="mono">{{ result.created }} ↗</a></div>
+      {% endif %}
+      {% if result.error %}<div class="errbox">{{ result.error }}</div>{% endif %}
+      {% if result.partial %}<div class="warnbox">{{ result.ok_count }} step(s) were written before the failure and are NOT rolled back. Check the accounts below before reopening.</div>{% endif %}
+      <ol class="steps">
+        {% for s in result.steps %}
+        <li class="{{ 'ok' if s.ok else 'bad' }}">
+          <div><span class="tick">{{ '✓' if s.ok else '✗' }}</span> <span class="op op-{{ s.op }}">{{ s.op|upper }}</span> {{ s.label }}</div>
+          <div class="small">{% if s.link %}<a href="{{ s.link }}" target="_blank" rel="noopener" class="mono">{{ s.account_id }} ↗</a>{% endif %}{% if s.summary %} <span class="muted">→ {{ s.summary }}</span>{% endif %}</div>
+          {% if s.error %}<div class="errbox small">{{ s.error }}</div>{% endif %}
+          {% if s.response_json %}<details><summary>API response</summary><pre>{{ s.response_json }}</pre></details>{% endif %}
+        </li>
+        {% endfor %}
+      </ol>
+      {% if result.links %}
+      <div class="openlinks"><b>Open in CRM:</b>
+        {% for l in result.links %}<a href="{{ l.link }}" target="_blank" rel="noopener" class="{{ 'created-link' if l.created else '' }}">{{ l.label }} ↗</a>{% endfor %}
+      </div>
+      {% endif %}
+    </section>
+    {% endif %}
+
+    {% if sop %}
+    <section class="card sop {{ 'sop-strong' if sop.strong else '' }}">
+      <h2>SOP: billing check</h2>
+      <p class="sop-headline">{{ sop.headline }}</p>
+      {% if sop.compact %}
+      <p class="small muted">None of the {{ sop.total }} account(s) involved has lifetime revenue or outstanding AR ($0 / $0), so the SOP restriction does not apply.</p>
+      {% else %}
+      {% for r in sop.rows %}
+      <div class="sop-acct {{ 'both' if r.both else '' }}">
+        <div class="sop-name">{% if r.link %}<a href="{{ r.link }}" target="_blank" rel="noopener">{{ r.name }} ↗</a>{% else %}{{ r.name }}{% endif %} <span class="muted small">{{ r.role }}</span></div>
+        <div class="sop-figs">
+          <div><span class="fig">{{ r.revenue }}</span><span class="figlabel">lifetime revenue</span></div>
+          <div><span class="fig">{{ r.ar }}</span><span class="figlabel">outstanding AR</span></div>
+        </div>
+        <div class="small">{{ r.verdict }}</div>
+      </div>
+      {% endfor %}
+      {% if sop.zero %}
+      <p class="small muted sop-zero">$0 revenue / $0 AR:
+        {% for r in sop.zero %}{% if r.link %}<a href="{{ r.link }}" target="_blank" rel="noopener">{{ r.name }}</a>{% else %}{{ r.name }}{% endif %}{{ ', ' if not loop.last else '' }}{% endfor %}
+      </p>
+      {% endif %}
+      {% endif %}
+    </section>
+    {% endif %}
+
+    <section class="card">
+      <h2>{{ 'What Approve will do' if approvable or not result else 'Actions in this proposal' }}</h2>
+      {% if not actions %}
+      <p class="muted">Nothing: no CRM writes.</p>
+      {% else %}
+      <ol class="actions">
+        {% for a in actions %}
+        <li>
+          <div class="act-head"><span class="op op-{{ a.op }}">{{ a.op|upper }}</span> <b>{{ a.label }}</b></div>
+          <div class="act-target small">
+            {% if a.op == 'create' %}target: <span class="ref">new account</span>
+            {% elif a.target_is_new %}target: <span class="ref">the newly created account</span>
+            {% else %}target: {% if a.target_link %}<a href="{{ a.target_link }}" target="_blank" rel="noopener">{{ a.target_name or a.target }} ↗</a>{% endif %} <span class="mono muted">{{ a.target }}</span>{% endif %}
+          </div>
+          <dl class="kv">
+            {% for f in a.fields %}
+            <dt>{{ f.key }}</dt>
+            <dd>{% if f.old is not none %}<del>{{ f.old }}</del> <span class="arrow">→</span> {% endif %}{{ m.value(f.value) }}</dd>
+            {% endfor %}
+          </dl>
+          <details><summary class="mono">{{ a.method }} {{ a.path }}</summary><pre>{{ a.payload }}</pre></details>
+        </li>
+        {% endfor %}
+      </ol>
+      {% endif %}
+    </section>
+  </aside>
+</div>
+{% endblock %}

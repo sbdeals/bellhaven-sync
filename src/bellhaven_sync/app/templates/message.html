@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} · {{ app_name }}{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>{{ title }}</h1>
+  <p>{{ message }}</p>
+  <p><a href="/">Back to the queue</a></p>
+</div>
+{% endblock %}

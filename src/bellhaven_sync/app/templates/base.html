@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}{{ app_name }}{% endblock %}</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/">Bellhaven CRM Sync <span>— Review</span></a>
+  <nav class="topnav">
+    <a href="/" class="{{ 'active' if nav == 'queue' else '' }}">Queue</a>
+    <a href="/runs" class="{{ 'active' if nav == 'runs' else '' }}">Runs</a>
+    <a href="/api/proposals?status=pending">JSON</a>
+  </nav>
+  <div class="who">Reviewer <strong>{{ reviewer }}</strong><span class="sep">·</span>CRM <strong>{{ crm_host }}</strong></div>
+</header>
+<nav class="tabs" aria-label="Proposal status">
+  {% for t in tabs %}
+  <a href="/?status={{ t.key }}" class="tab tab-{{ t.key }} {{ 'active' if t.key == active_tab else '' }}">{{ t.label }}<span class="count">{{ t.count }}</span></a>
+  {% endfor %}
+</nav>
+<main>
+  {% if flash %}
+  <div class="flash flash-{{ flash.level }}" role="status">
+    <strong>{{ flash.text }}</strong>
+    {% if flash.subject %}<span class="flash-subject">“{{ flash.subject }}”</span>{% endif %}
+    {% if flash.link %}<a href="{{ flash.link }}">Open</a>{% endif %}
+  </div>
+  {% endif %}
+  {% block content %}{% endblock %}
+</main>
+<script>
+  // Confirm dialogs (Approve writes to the CRM) and double-submit protection.
+  document.addEventListener('click', function (e) {
+    var b = e.target.closest('[data-confirm]');
+    if (b && !window.confirm(b.getAttribute('data-confirm'))) { e.preventDefault(); }
+  });
+  document.addEventListener('submit', function (e) {
+    var f = e.target;
+    setTimeout(function () { f.querySelectorAll('button').forEach(function (b) { b.disabled = true; }); }, 0);
+  });
+  window.addEventListener('pageshow', function () {
+    document.querySelectorAll('form button').forEach(function (b) { b.disabled = false; });
+  });
+</script>
+</body>
+</html>

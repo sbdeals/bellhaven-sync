@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}Runs · {{ app_name }}{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>Pipeline runs</h1>
+  <p class="muted">Each run scrapes the website, reads the CRM (read-only) and records proposals. Decided proposals are never re-proposed.</p>
+</div>
+{% if not runs %}
+<div class="empty">No runs yet. Run <code>bellhaven-sync run</code> to generate proposals.</div>
+{% else %}
+<section class="card">
+<div class="table-wrap">
+<table class="grid">
+  <thead>
+    <tr><th>Run</th><th>Started</th><th>Finished</th><th class="num">Website</th><th class="num">CRM accounts</th><th class="num">New</th><th class="num">Refreshed</th><th class="num">Previously decided</th><th class="num">Stale</th><th>Notes</th></tr>
+  </thead>
+  <tbody>
+    {% for r in runs %}
+    <tr>
+      <td class="mono">#{{ r.run_id }}</td>
+      <td>{{ r.started_at|ts }}</td>
+      <td>{% if r.finished_at %}{{ r.finished_at|ts }}{% else %}<span class="badge status status-stale">unfinished</span>{% endif %}</td>
+      <td class="num">{{ r.site_count }}</td>
+      <td class="num">{{ r.crm_count }}</td>
+      <td class="num"><b>{{ r.proposals_new }}</b></td>
+      <td class="num">{{ r.proposals_refreshed }}</td>
+      <td class="num">{{ r.proposals_previously_decided }}</td>
+      <td class="num">{{ r.proposals_stale }}</td>
+      <td class="small">{{ r.notes }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+</div>
+</section>
+{% endif %}
+{% endblock %}

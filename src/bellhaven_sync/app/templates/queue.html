@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}{{ tab_title }} · {{ app_name }}{% endblock %}
+{% block content %}
+<div class="page-head">
+  <h1>{{ tab_title }} <span class="muted">({{ total }})</span></h1>
+  <p class="muted">{{ tab_help }}</p>
+</div>
+
+{% if kind_chips|length > 1 or kind %}
+<div class="chips">
+  <a href="/?status={{ active_tab }}" class="chip {{ 'active' if not kind else '' }}">All kinds <b>{{ total }}</b></a>
+  {% for c in kind_chips %}
+  <a href="/?status={{ active_tab }}&amp;kind={{ c.kind }}" class="chip {{ 'active' if c.kind == kind else '' }}"><span class="dot kind-{{ c.kind }}"></span>{{ c.label }} <b>{{ c.count }}</b></a>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% if not rows %}
+<div class="empty">Nothing here{{ ' for this kind' if kind else '' }}.</div>
+{% else %}
+<ul class="queue">
+  {% for r in rows %}
+  <li class="qrow prio-edge-{{ r.priority }}">
+    <div class="qbadges">
+      <span class="badge prio prio-{{ r.priority }}">{{ r.priority }}</span>
+      <span class="badge kind kind-{{ r.kind }}">{{ r.kind_label }}</span>
+      {% if show_status or r.status not in ('pending',) %}<span class="badge status status-{{ r.status }}">{{ r.status }}</span>{% endif %}
+    </div>
+    <div class="qmain">
+      <a class="qtitle" href="/proposals/{{ r.fp }}">{{ r.title }}</a>
+      <div class="qsummary">{{ r.summary }}</div>
+      <div class="qlinks">
+        {% if r.subject_link %}<a href="{{ r.subject_link }}" target="_blank" rel="noopener">CRM: {{ r.subject_name or r.subject_id }} ↗</a>{% endif %}
+        {% if r.site_url %}<a href="{{ r.site_url }}" target="_blank" rel="noopener">Website: {{ r.site_name }} ↗</a>{% endif %}
+        {% if r.kind != 'confirmed' %}<span class="muted">{{ r.n_actions }} CRM write{{ '' if r.n_actions == 1 else 's' }}</span>{% endif %}
+        {% if r.decided_by %}<span class="muted">decided by {{ r.decided_by }} · {{ r.decided_at|ts }}</span>{% endif %}
+      </div>
+      {% if r.error %}<div class="qerror">{{ r.error }}</div>{% endif %}
+    </div>
+    <div class="qactions">
+      {% if r.approvable %}
+      <form method="post" action="/proposals/{{ r.fp }}/approve">
+        <button type="submit" class="btn btn-approve" data-confirm="{{ r.confirm }}">Approve</button>
+      </form>
+      <form method="post" action="/proposals/{{ r.fp }}/reject">
+        <input type="hidden" name="back" value="{{ active_tab }}">
+        <button type="submit" class="btn btn-reject">Reject</button>
+      </form>
+      {% elif r.reopenable %}
+      <form method="post" action="/proposals/{{ r.fp }}/reopen">
+        <button type="submit" class="btn btn-secondary" data-confirm="Put this proposal back in the pending queue?">Reopen</button>
+      </form>
+      {% endif %}
+      <a class="btn btn-ghost" href="/proposals/{{ r.fp }}">Details</a>
+    </div>
+  </li>
+  {% endfor %}
+</ul>
+{% endif %}
+{% endblock %}

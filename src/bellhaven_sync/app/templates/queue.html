@@ -28,7 +28,7 @@
     </div>
     <div class="qmain">
       <a class="qtitle" href="/proposals/{{ r.fp }}">{{ r.title }}</a>
-      <div class="qsummary">{{ r.summary }}</div>
+      <div class="qsummary">{{ r.summary }}{% if r.cluster_line %} <span class="qcluster">· {{ r.cluster_line }}</span>{% endif %}</div>
       <div class="qlinks">
         {% if r.subject_link %}<a href="{{ r.subject_link }}" target="_blank" rel="noopener">CRM: {{ r.subject_name or r.subject_id }} ↗</a>{% endif %}
         {% if r.site_url %}<a href="{{ r.site_url }}" target="_blank" rel="noopener">Website: {{ r.site_name }} ↗</a>{% endif %}

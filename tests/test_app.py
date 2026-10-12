@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import warnings
 from pathlib import Path
 from typing import Any
@@ -345,3 +346,195 @@ def test_counts_in_nav(env):
     html = client.get("/").text
     assert 'Pending<span class="count">4</span>' in html
     assert 'Confirmed (no change)<span class="count">1</span>' in html
+
+
+
+# ------------------------------------------------- duplicate clusters: choosing the survivor
+MONROE_BH = "001U1750VLVJAGG1S5"  # Bellhaven Gardens of Monroe (under Bellhaven)
+MONROE_CT = "0011AB44D05WLA9HTX"  # Cedar Trail of Monroe
+MONROE_HV = "00159PL81N38KM4FHM"  # Monroe Gardens Care Center (Harborview)
+MONROE_IDS = [MONROE_BH, MONROE_CT, MONROE_HV]
+
+
+def candidate(acct_id: str, rank: int, reason: str, *, phone: bool = False, admin: bool = False, sim: float = 70.0) -> dict[str, Any]:
+    contacts = [{k: c.get(k) for k in ("name", "title", "email", "phone", "is_active")} for c in _CONTACTS if c["account_id"] == acct_id]
+    return {
+        **_ACCOUNTS[acct_id], "contacts": contacts, "phone_match": phone, "admin_match": admin,
+        "name_similarity": sim, "rank": rank, "rank_reason": reason,
+    }
+
+
+def retire_actions(survivor: str, ids: list[str]) -> list[Action]:
+    return [
+        Action(op="patch", account_id=i, fields={"duplicate_of_account": survivor, "status": "Inactive", "note": f"Duplicate of {survivor}"},
+               label=f"Retire {_ACCOUNTS[i]['name']} as a duplicate")
+        for i in ids
+        if i != survivor
+    ]
+
+
+def duplicate_monroe(tie: bool = False) -> Proposal:
+    """One proposal for a 3-account cluster, built by hand to the engine's evidence["cluster"] contract."""
+    site_rec = site("bellhaven-gardens-of-monroe", "Bellhaven Gardens of Monroe", "750 Stewart Rd", "Monroe", "48162", "(814) 412-2218", "Phil Mabry", care=("Assisted Living",))
+    site_rec["state"] = "MI"
+    ev = evidence(site_rec, {MONROE_BH: "survivor", MONROE_CT: "loser", MONROE_HV: "loser"}, None, "Three CRM accounts share 750 Stewart Rd.", [])
+    ev["cluster"] = {
+        "candidates": [
+            candidate(MONROE_BH, 1, "Tie on every criterion; lowest account id." if tie else "Under Bellhaven and closest name to the website.", sim=100.0),
+            candidate(MONROE_CT, 2, "Tie on every criterion." if tie else "Not under Bellhaven.", sim=60.0),
+            candidate(MONROE_HV, 3, "Tie on every criterion." if tie else "Not under Bellhaven; lowest name similarity.", sim=55.0),
+        ],
+        "recommended": MONROE_BH, "tie": tie, "bellhaven_parent_id": BELLHAVEN_PARENT_ID,
+    }
+    return Proposal(
+        kind=ProposalKind.DUPLICATE, priority="medium",
+        title="Duplicate accounts: Bellhaven Gardens of Monroe (3 CRM records)",
+        summary="Three CRM accounts at 750 Stewart Rd are one facility.",
+        subject_account_id=MONROE_BH, site_slug="bellhaven-gardens-of-monroe",
+        actions=retire_actions(MONROE_BH, MONROE_IDS), evidence=ev,
+    )
+
+
+def make_client(*proposals: Proposal):
+    store = Store(":memory:")
+    crm = FakeCRM()
+    store.upsert_proposals(proposals, store.start_run())
+    settings = Settings(token="t", base_url="https://crm.example.test", reviewer_name="tester")
+    return TestClient(create_app(settings, store, crm)), store, crm
+
+
+@pytest.fixture
+def rebuild(monkeypatch):
+    """Stub for the engine's pure rebuild function (it may not exist yet); records its calls."""
+    import bellhaven_sync.proposals as proposals_mod
+
+    calls: list[tuple[dict, str]] = []
+
+    def stub(evidence: dict, survivor_id: str) -> list[Action]:
+        calls.append((evidence, survivor_id))
+        return retire_actions(survivor_id, [c["account_id"] for c in evidence["cluster"]["candidates"]])
+
+    monkeypatch.setattr(proposals_mod, "build_duplicate_group_actions", stub, raising=False)
+    return calls
+
+
+def radios(html: str) -> list[str]:
+    return re.findall(r'<input type="radio" name="survivor"[^>]*>', html)
+
+
+def test_duplicate_cluster_shows_survivor_choice():
+    p = duplicate_monroe()
+    client, *_ = make_client(p)
+    html = client.get(f"/proposals/{p.fingerprint}").text
+    rs = radios(html)
+    assert len(rs) == 3
+    assert [r for r in rs if " checked" in r] == [r for r in rs if f'value="{MONROE_BH}"' in r]
+    assert "Choose the surviving account" in html
+    assert "No automatic recommendation" not in html
+    assert "Approve will mark 2 copies Inactive pointing at the survivor" in html
+    assert "Not under Bellhaven; lowest name similarity." in html  # rank reason
+    assert "Elaine Vogel" in html and "Cedar Trail Communities (Parent Account)" in html
+    assert "Website vs CRM" in html  # the comparison table is kept
+    # the confirm dialog names the survivor picked in the radio group (substituted by base.html JS)
+    assert "Survivor (kept): {survivor}" in html
+    assert "querySelector('input[name=\"survivor\"]:checked')" in html
+    # the radios live inside the approve form
+    form = html[html.index('<form method="post" class="decision-form">'):]
+    form = form[: form.index("</form>")]
+    assert len(radios(form)) == 3 and f"/proposals/{p.fingerprint}/approve" in form
+    # queue row
+    q = client.get("/").text
+    assert "2 copies · recommended: Bellhaven Gardens of Monroe" in q
+    assert "Survivor (kept): Bellhaven Gardens of Monroe (001U1750VLVJAGG1S5)" in q
+
+
+def test_duplicate_cluster_tie_banner_defaults_to_recommended():
+    p = duplicate_monroe(tie=True)
+    client, *_ = make_client(p)
+    html = client.get(f"/proposals/{p.fingerprint}").text
+    assert "No automatic recommendation: the candidates tied on every criterion; pick the survivor" in html
+    rs = radios(html)
+    assert len(rs) == 3 and [r for r in rs if " checked" in r] == [r for r in rs if f'value="{MONROE_BH}"' in r]
+
+
+def test_old_per_loser_duplicate_keeps_old_layout(env):
+    client, store, crm, fps = env
+    html = client.get(f"/proposals/{fps['dup']}").text
+    assert not radios(html) and "Choose the surviving account" not in html
+    assert "Harborview Nursing &amp; Rehab of Port Clinton" in html
+    # a survivor cannot be honoured without a candidate list: refused, nothing written
+    r = client.post(f"/proposals/{fps['dup']}/approve", data={"survivor": PORT_CLINTON_BH})
+    assert r.status_code == 400 and crm.writes == [] and store.get(fps["dup"]).status == "pending"
+
+
+def test_approve_default_survivor_applies_stored_actions(rebuild):
+    p = duplicate_monroe()
+    client, store, crm = make_client(p)
+    r = client.post(f"/proposals/{p.fingerprint}/approve", data={"survivor": MONROE_BH, "note": "ok"}, follow_redirects=False)
+    assert r.status_code == 303
+    assert rebuild == []  # stored actions used as-is
+    assert crm.writes == [(a.op, a.account_id, a.fields) for a in p.actions]
+    sp = store.get(p.fingerprint)
+    assert sp.status == "applied" and sp.reviewer_note == "ok"
+    assert sp.apply_result["chosen_survivor"] == MONROE_BH and "applied_actions" not in sp.apply_result
+    assert "Survivor kept" in client.get(f"/proposals/{p.fingerprint}").text
+
+
+def test_approve_with_other_survivor_rebuilds_and_records_it(rebuild):
+    p = duplicate_monroe()
+    client, store, crm = make_client(p)
+    r = client.post(f"/proposals/{p.fingerprint}/approve", data={"survivor": MONROE_CT, "note": "Cedar Trail is the billing record"}, follow_redirects=False)
+    assert r.status_code == 303
+    assert [s for _, s in rebuild] == [MONROE_CT] and rebuild[0][0]["cluster"]["recommended"] == MONROE_BH
+    assert sorted(w[1] for w in crm.writes) == sorted([MONROE_BH, MONROE_HV])
+    assert all(w[0] == "patch" and w[2]["duplicate_of_account"] == MONROE_CT for w in crm.writes)
+    assert crm.raw(MONROE_BH)["duplicate_of_account"] == MONROE_CT
+    sp = store.get(p.fingerprint)
+    assert sp.status == "applied"
+    assert sp.reviewer_note == f"survivor={MONROE_CT} (Cedar Trail of Monroe); Cedar Trail is the billing record"
+    # the stored proposal is untouched (stable fingerprint); only the apply result records the deviation
+    assert sp.proposal.fingerprint == p.fingerprint and sp.proposal.actions == p.actions
+    api = client.get(f"/api/proposals/{p.fingerprint}").json()
+    assert api["apply_result"]["chosen_survivor"] == MONROE_CT
+    assert api["apply_result"]["recommended_survivor"] == MONROE_BH
+    assert [a["account_id"] for a in api["apply_result"]["applied_actions"]] == [w[1] for w in crm.writes]
+    html = client.get(r.headers["location"]).text
+    assert "Approved and applied to the CRM." in html
+    assert "Survivor kept" in html and "chosen by reviewer; recommended was Bellhaven Gardens of Monroe" in html
+    kept = html[html.index("Survivor kept"):]
+    assert MONROE_CT in kept[:400] and "Cedar Trail of Monroe" in kept[:400]
+    assert "Actions applied for the reviewer-chosen survivor" in html
+    assert "2/2 steps" in html
+
+
+def test_approve_with_unknown_survivor_is_refused(rebuild):
+    p = duplicate_monroe()
+    client, store, crm = make_client(p)
+    r = client.post(f"/proposals/{p.fingerprint}/approve", data={"survivor": "001NOTINCLUSTER000"}, follow_redirects=False)
+    assert r.status_code == 400
+    assert "not one of the candidate accounts" in r.text
+    assert crm.writes == [] and rebuild == []
+    sp = store.get(p.fingerprint)
+    assert sp.status == "pending" and sp.apply_result is None and sp.decided_by is None
+
+
+def test_field_drift_has_a_badge():
+    kind = getattr(ProposalKind, "FIELD_DRIFT", None)
+    if kind is None:
+        pytest.skip("ProposalKind.FIELD_DRIFT not added by the engine yet")
+    p = Proposal(
+        kind=kind, priority="low", title="Phone drift: Bellhaven Rehabilitation & Nursing of Grove City",
+        summary="CRM phone differs from the website.", subject_account_id=GROVE_CITY,
+        site_slug="bellhaven-rehabilitation-nursing-of-grove-city",
+        actions=[Action(op="patch", account_id=GROVE_CITY, fields={"phone": "(614) 555-7729"}, label="Update phone to the website value")],
+        evidence=evidence(
+            site("bellhaven-rehabilitation-nursing-of-grove-city", "Bellhaven Rehabilitation & Nursing of Grove City", "3985 Broadway", "Grove City", "43123", "(614) 555-7729", "Marie Vogel"),
+            {GROVE_CITY: "subject"}, score(96.5), "Matched account; one field differs from the website.", [],
+        ),
+    )
+    client, *_ = make_client(p, rename_grove_city())
+    q = client.get("/").text
+    assert '<span class="badge kind kind-field_drift">Field drift</span>' in q
+    assert '<span class="dot kind-field_drift"></span>Field drift' in q  # kind filter chip
+    assert '<span class="badge kind kind-field_drift">Field drift</span>' in client.get(f"/proposals/{p.fingerprint}").text
+    assert ".kind-field_drift" in client.get("/static/app.css").text

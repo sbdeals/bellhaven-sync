@@ -105,6 +105,7 @@ main { max-width: 1440px; margin: 0 auto; padding: 1rem 1.5rem 3rem; }
 .kind-chow_out { background: #fbe0e5; color: #9d1c3a; }
 .kind-not_on_website { background: #f3ecd9; color: #6d5410; }
 .kind-parent_acquired { background: #e4e8ee; color: #3b4a5e; }
+.kind-field_drift { background: #ddf1f8; color: #0b5d78; }
 .dot { display: inline-block; width: .6rem; height: .6rem; border-radius: 50%; margin-right: .35rem; vertical-align: 0; }
 
 .status-pending { background: #dbeafe; color: #1e40af; }
@@ -143,6 +144,7 @@ main { max-width: 1440px; margin: 0 auto; padding: 1rem 1.5rem 3rem; }
 .dot.kind-create { background: #1a9a85; } .dot.kind-duplicate { background: #e07428; }
 .dot.kind-chow_out { background: #d0405f; } .dot.kind-not_on_website { background: #b18d2c; }
 .dot.kind-parent_acquired { background: #6b7c93; }
+.dot.kind-field_drift { background: #1f93bd; }
 
 .queue { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: .55rem; }
 .qrow {
@@ -306,3 +308,19 @@ details summary { cursor: pointer; color: var(--muted); font-size: .8rem; margin
 .sop:not(.sop-strong) h2 { color: var(--text); }
 .parents { margin: -.2rem 0 .6rem; color: #3a4656; }
 .sop-zero { margin: .3rem 0 0; }
+
+/* duplicate cluster: survivor choice */
+.survivor-pick { border: 1px solid var(--border); border-radius: var(--radius); padding: .5rem .6rem .6rem; margin: 0 0 .6rem; }
+.survivor-pick legend { font-weight: 800; padding: 0 .3rem; }
+.tie-banner { background: var(--amber-bg); color: #6b4500; border: 1px solid #f0cf7a; border-radius: 6px; padding: .45rem .6rem; margin-bottom: .5rem; font-weight: 700; font-size: .88rem; }
+.survivor-opt { display: flex; gap: .55rem; align-items: flex-start; border: 1px solid var(--border); border-radius: 6px; padding: .45rem .55rem; margin-bottom: .4rem; cursor: pointer; background: #fff; }
+.survivor-opt:has(input:checked) { border-color: var(--green); background: var(--green-bg); box-shadow: inset 3px 0 0 var(--green); }
+.survivor-opt input { margin-top: .25rem; flex: none; }
+.so-body { min-width: 0; }
+.so-line { display: block; overflow-wrap: anywhere; }
+.so-line.flags { display: flex; flex-wrap: wrap; gap: .25rem; margin: .2rem 0; }
+.so-off { color: var(--amber); }
+.so-reason { color: #2c3746; font-style: italic; }
+.so-summary { font-weight: 700; margin: .2rem 0; }
+.survivor-kept { margin: .2rem 0 .5rem; }
+.qcluster { color: var(--muted); font-weight: 600; }

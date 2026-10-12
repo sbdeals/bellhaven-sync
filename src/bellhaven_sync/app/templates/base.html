@@ -35,7 +35,12 @@
   // Confirm dialogs (Approve writes to the CRM) and double-submit protection.
   document.addEventListener('click', function (e) {
     var b = e.target.closest('[data-confirm]');
-    if (b && !window.confirm(b.getAttribute('data-confirm'))) { e.preventDefault(); }
+    if (!b) { return; }
+    var msg = b.getAttribute('data-confirm');
+    // Duplicate clusters: name the survivor picked in the form's radio group.
+    var s = b.form && b.form.querySelector('input[name="survivor"]:checked');
+    if (s) { msg = msg.split('{survivor}').join(s.getAttribute('data-label') || s.value); }
+    if (!window.confirm(msg)) { e.preventDefault(); }
   });
   document.addEventListener('submit', function (e) {
     var f = e.target;

@@ -12,6 +12,7 @@ import json
 import logging
 import re
 import threading
+from dataclasses import replace
 from pathlib import Path
 from typing import Annotated, Any
 from urllib.parse import quote, urlsplit
@@ -24,7 +25,7 @@ from jinja2 import ChainableUndefined, Environment, FileSystemLoader, select_aut
 from ..apply import ApplyResult, apply_proposal
 from ..config import Settings
 from ..crm import CRM
-from ..models import NEW_ACCOUNT_REF, Proposal
+from ..models import NEW_ACCOUNT_REF, Action, Proposal
 from ..store import PartiallyAppliedError, Store, StoredProposal
 
 log = logging.getLogger(__name__)
@@ -47,6 +48,8 @@ TAB_KEYS = [k for k, _ in STATUS_TABS] + [CONFIRMED]
 APPROVABLE = frozenset({"pending", "stale"})
 REOPENABLE = frozenset({"rejected", "failed"})
 SOP_KINDS = frozenset({"reparent", "chow_reparent", "duplicate", "chow_out"})
+DUPLICATE = "duplicate"
+SURVIVOR_TOKEN = "{survivor}"  # replaced in the browser by the checked survivor radio (base.html)
 NEW_ACCOUNT_TEXT = "the newly created account"
 ID_FIELDS = frozenset({"parent_id", "chow_current_account", "duplicate_of_account", "account_id"})
 
@@ -60,6 +63,7 @@ KIND_LABELS = {
     "chow_out": "CHOW out",
     "not_on_website": "Not on website",
     "parent_acquired": "Parent acquired",
+    "field_drift": "Field drift",
 }
 ROLE_LABELS = {
     "subject": "CRM · subject",
@@ -164,6 +168,70 @@ def _cell(text: Any = "", cls: str = "", **extra: Any) -> dict[str, Any]:
     return {"text": "" if text is None else str(text), "cls": cls, **extra}
 
 
+def _copies(n: int) -> str:
+    return f"{n} cop{'y' if n == 1 else 'ies'}"
+
+
+def raw_cluster(p: Proposal) -> dict[str, Any] | None:
+    """`evidence["cluster"]` of a one-proposal-per-cluster duplicate, normalized, or None.
+
+    Older stored duplicate proposals (one per loser) have no cluster and keep the old layout.
+    `recommended` always names one of the candidates (falls back to the first/top-ranked)."""
+    if str(p.kind) != DUPLICATE or not isinstance(p.evidence, dict):
+        return None
+    cl = p.evidence.get("cluster")
+    if not isinstance(cl, dict):
+        return None
+    cands = [c for c in (cl.get("candidates") or []) if isinstance(c, dict) and c.get("account_id")]
+    if not cands:
+        return None
+    ids = [c["account_id"] for c in cands]
+    rec = cl.get("recommended") if cl.get("recommended") in ids else ids[0]
+    return {**cl, "candidates": cands, "recommended": rec, "by_id": dict(zip(ids, cands))}
+
+
+def _cand_label(c: dict[str, Any]) -> str:
+    return f"{c.get('name') or c['account_id']} ({c['account_id']})"
+
+
+class SurvivorChoiceError(ValueError):
+    """The posted survivor cannot be honoured; nothing is decided or written."""
+
+    def __init__(self, message: str, status_code: int = 400):
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def resolve_survivor(p: Proposal, survivor: str) -> tuple[Proposal, dict[str, Any], str]:
+    """Pick the actions to apply for a reviewer-chosen duplicate survivor.
+
+    Returns (proposal to apply, extra keys for the stored apply result, reviewer-note prefix).
+    The stored proposal is never modified: a different survivor only yields a copy with
+    rebuilt actions (same fingerprint), and the apply result records the deviation."""
+    cl = raw_cluster(p)
+    if cl is None:
+        if survivor and str(p.kind) == DUPLICATE:
+            raise SurvivorChoiceError("This duplicate proposal has no candidate list, so a survivor cannot be chosen.")
+        return p, {}, ""
+    rec = cl["recommended"]
+    if not survivor or survivor == rec:
+        return p, {"chosen_survivor": rec, "recommended_survivor": rec}, ""
+    if survivor not in cl["by_id"]:
+        raise SurvivorChoiceError(f"{survivor!r} is not one of the candidate accounts of this duplicate cluster.")
+    try:
+        from ..proposals import build_duplicate_group_actions  # lazy: the engine owns it; tests monkeypatch it
+
+        built = build_duplicate_group_actions(p.evidence, survivor)
+        actions = [a if isinstance(a, Action) else Action.from_dict(a) for a in built or []]
+    except Exception as exc:
+        log.exception("rebuilding duplicate actions for survivor %s failed", survivor)
+        raise SurvivorChoiceError(f"Could not rebuild the actions for survivor {survivor}: {type(exc).__name__}: {exc}.", 500) from exc
+    if not actions:
+        raise SurvivorChoiceError(f"Rebuilding the actions for survivor {survivor} produced no CRM writes.", 500)
+    extra = {"chosen_survivor": survivor, "recommended_survivor": rec, "applied_actions": [a.to_dict() for a in actions]}
+    return replace(p, actions=actions), extra, f"survivor={survivor} ({cl['by_id'][survivor].get('name') or ''})"
+
+
 # ------------------------------------------------------------------------ view builders
 class Views:
     """Turns stored proposals into plain dicts for the templates."""
@@ -194,6 +262,12 @@ class Views:
                 names[a["account_id"]] = a.get("name", "")
             if a.get("parent_id") and a.get("parent_name"):
                 names[a["parent_id"]] = a["parent_name"]
+        cluster = evidence.get("cluster") if isinstance(evidence, dict) else None
+        for c in (cluster.get("candidates") or []) if isinstance(cluster, dict) else []:
+            if isinstance(c, dict) and c.get("account_id"):
+                names.setdefault(c["account_id"], c.get("name", ""))
+                if c.get("parent_id") and c.get("parent_name"):
+                    names.setdefault(c["parent_id"], c["parent_name"])
         if self.settings.parent_account_id:
             names.setdefault(self.settings.parent_account_id, self.settings.parent_account_name)
         return names
@@ -391,6 +465,9 @@ class Views:
     def actions(self, p: Proposal, known: dict[str, str] | None = None) -> list[dict[str, Any]]:
         names = self.id_names(p.evidence, known)
         by_id = {a.get("account_id"): a for a in self.accounts(p.evidence)}
+        cl = raw_cluster(p)
+        for cid, c in (cl["by_id"] if cl else {}).items():
+            by_id.setdefault(cid, c)
         out = []
         for i, a in enumerate(p.actions, 1):
             target = a.account_id
@@ -425,11 +502,69 @@ class Views:
         return out
 
     @staticmethod
-    def confirm_text(p: Proposal) -> str:
+    def confirm_text(p: Proposal, survivor_label: str | None = None) -> str:
+        cl = raw_cluster(p)
+        if cl is not None:
+            label = survivor_label or _cand_label(cl["by_id"][cl["recommended"]])
+            lines = ["Approve and write this duplicate merge to the CRM?", "", p.title, "", f"Survivor (kept): {label}"]
+            lines.append(f"The other {_copies(len(cl['candidates']) - 1)} will point at the survivor via duplicate_of_account.")
+            if cl.get("tie"):
+                lines.append("(Tie: there was no automatic recommendation.)")
+            return "\n".join(lines)
         n = len(p.actions)
         lines = [f"Approve and write {n} change{'s' if n != 1 else ''} to the CRM?", "", p.title]
         lines += [f"  {i}. {a.label or a.op}" for i, a in enumerate(p.actions, 1)]
         return "\n".join(lines)
+
+    # ----------------------------------------------------- duplicate cluster
+    def cluster(self, p: Proposal) -> dict[str, Any] | None:
+        cl = raw_cluster(p)
+        if cl is None:
+            return None
+        bh_parent = cl.get("bellhaven_parent_id")
+        rows = []
+        for c in cl["candidates"]:
+            rev, ar = _num(c.get("lifetime_revenue")), _num(c.get("outstanding_ar"))
+            city = ", ".join(x for x in (c.get("billing_city"), c.get("billing_state")) if x)
+            where = ", ".join(x for x in (c.get("billing_street"), f"{city} {c.get('billing_zip') or ''}".strip()) if x)
+            sim = c.get("name_similarity")
+            rows.append(
+                {
+                    "account_id": c["account_id"],
+                    "name": c.get("name") or c["account_id"],
+                    "label": _cand_label(c),
+                    "link": self.crm_url(c["account_id"]),
+                    "status": c.get("status") or "",
+                    "parent": c.get("parent_name") or c.get("parent_id") or "(no parent)",
+                    "parent_link": self.crm_url(c.get("parent_id")),
+                    "parent_ok": (c.get("parent_id") == bh_parent) if bh_parent else self.is_target_parent(c),
+                    "street": where,
+                    "care_type": c.get("care_type") or "",
+                    "revenue": money(rev),
+                    "ar": money(ar),
+                    "both": rev > 0 and ar > 0,
+                    "contacts": [
+                        {"name": x.get("name", ""), "title": x.get("title", ""), "inactive": not x.get("is_active", True)}
+                        for x in (c.get("contacts") or [])
+                        if isinstance(x, dict)
+                    ],
+                    "phone_match": bool(c.get("phone_match")),
+                    "admin_match": bool(c.get("admin_match")),
+                    "name_similarity": f"{_num(sim):g}" if sim is not None else None,
+                    "rank": c.get("rank"),
+                    "rank_reason": c.get("rank_reason") or "",
+                    "recommended": c["account_id"] == cl["recommended"],
+                }
+            )
+        n = len(rows) - 1
+        return {
+            "candidates": rows,
+            "recommended": cl["recommended"],
+            "tie": bool(cl.get("tie")),
+            "n_copies": n,
+            "summary": f"Approve will mark {_copies(n)} Inactive pointing at the survivor, "
+            "and update the survivor to the website identity if needed.",
+        }
 
     # -------------------------------------------------------------------- SOP
     def sop(self, p: Proposal) -> dict[str, Any] | None:
@@ -523,7 +658,20 @@ class Views:
                 label = f"New account: {label}" if label else "New account"
             links.append({"id": i, "label": label or i, "link": self.crm_url(i), "created": i == created})
         ok_steps = [s for s in steps if s["ok"]]
+        applied_actions = r.get("applied_actions")
+        survivor = None
+        if r.get("chosen_survivor"):
+            cs, rec = str(r["chosen_survivor"]), r.get("recommended_survivor")
+            survivor = {
+                "id": cs,
+                "name": names.get(cs, ""),
+                "link": self.crm_url(cs),
+                "overridden": bool(rec) and rec != cs,
+                "recommended_id": rec,
+                "recommended_name": names.get(rec or "", ""),
+            }
         return {
+            "survivor": survivor,
             "ok": bool(r.get("ok")),
             "error": r.get("error"),
             "created": created,
@@ -532,7 +680,7 @@ class Views:
             "links": links,
             "partial": (not r.get("ok")) and bool(ok_steps),
             "ok_count": len(ok_steps),
-            "total": len(sp.proposal.actions),
+            "total": len(applied_actions) if isinstance(applied_actions, list) else len(sp.proposal.actions),
         }
 
     # ------------------------------------------------------------- queue rows
@@ -543,6 +691,13 @@ class Views:
         names = self.id_names(ev)
         kind = str(p.kind)
         err = sp.apply_result.get("error") if isinstance(sp.apply_result, dict) else None
+        cl = raw_cluster(p)
+        cluster_line = ""
+        if cl is not None and "recommended" not in (p.summary or "").lower():
+            rec = cl["by_id"][cl["recommended"]]
+            cluster_line = f"{_copies(len(cl['candidates']) - 1)} · recommended: {rec.get('name') or rec['account_id']}"
+            if cl.get("tie"):
+                cluster_line += " (tie: pick the survivor)"
         return {
             "fp": p.fingerprint,
             "kind": kind,
@@ -551,6 +706,7 @@ class Views:
             "status": sp.status,
             "title": p.title,
             "summary": p.summary,
+            "cluster_line": cluster_line,
             "subject_id": p.subject_account_id,
             "subject_name": names.get(p.subject_account_id or "", ""),
             "subject_link": self.crm_url(p.subject_account_id),
@@ -641,6 +797,16 @@ def create_app(settings: Settings, store: Store, crm: CRM) -> FastAPI:
             known: dict[str, str] = {}
             for other in store.list():
                 known.update(views.id_names(other.proposal.evidence or {}))
+        row = views.row(sp)
+        cluster = views.cluster(p)
+        # After a reviewer picked a non-recommended survivor, show what was actually applied.
+        applied = sp.apply_result.get("applied_actions") if isinstance(sp.apply_result, dict) else None
+        shown, actions_overridden = p, False
+        if isinstance(applied, list) and applied:
+            try:
+                shown, actions_overridden = replace(p, actions=[Action.from_dict(a) for a in applied]), True
+            except (KeyError, TypeError):
+                log.warning("unreadable applied_actions for %s", p.fingerprint[:12])
         return render(
             "detail.html",
             status_code=status_code,
@@ -649,12 +815,15 @@ def create_app(settings: Settings, store: Store, crm: CRM) -> FastAPI:
             flash=flash,
             sp=sp,
             p=p,
-            row=views.row(sp),
+            row=row,
+            cluster=cluster,
+            confirm=views.confirm_text(p, SURVIVOR_TOKEN) if cluster else row["confirm"],
+            actions_overridden=actions_overridden,
             ev=ev,
             site=ev.get("site") if isinstance(ev.get("site"), dict) else None,
             cmp=views.comparison(ev, known),
             score=views.score(ev.get("score")),
-            actions=views.actions(p, known),
+            actions=views.actions(shown, known),
             sop=views.sop(p),
             result=views.apply_result(sp, known),
             rule=ev.get("rule"),
@@ -715,7 +884,12 @@ def create_app(settings: Settings, store: Store, crm: CRM) -> FastAPI:
         return render_detail(sp, flash=flash_for(msg))
 
     @app.post("/proposals/{fingerprint}/approve")
-    def approve(request: Request, fingerprint: str, note: Annotated[str, Form()] = "") -> Response:
+    def approve(
+        request: Request,
+        fingerprint: str,
+        note: Annotated[str, Form()] = "",
+        survivor: Annotated[str, Form()] = "",
+    ) -> Response:
         if _foreign_origin(request):
             return refused()
         with lock:
@@ -724,16 +898,25 @@ def create_app(settings: Settings, store: Store, crm: CRM) -> FastAPI:
                 return not_found(fingerprint)
             if sp.status not in APPROVABLE:
                 return conflict(sp, "applied")
-            store.decide(fingerprint, "approved", by=settings.reviewer_name, note=note.strip())
+            try:  # a duplicate cluster may be approved with a reviewer-chosen survivor
+                to_apply, extra, note_prefix = resolve_survivor(sp.proposal, survivor.strip())
+            except SurvivorChoiceError as exc:
+                msg = f"{exc} Nothing was decided and nothing was written to the CRM."
+                return render("message.html", status_code=exc.status_code, title="Not applied", message=msg)
+            note = note.strip()
+            if note_prefix:
+                note = f"{note_prefix}; {note}" if note else note_prefix
+            store.decide(fingerprint, "approved", by=settings.reviewer_name, note=note)
             try:
-                result = apply_proposal(sp.proposal, crm)
+                result = apply_proposal(to_apply, crm)
             except Exception as exc:  # apply_proposal reports its own errors; last-resort guard
                 log.exception("apply crashed for %s", fingerprint)
                 result = ApplyResult(ok=False, steps=[], created_account_id=None, error=f"{type(exc).__name__}: {exc}")
+            outcome = {**result.to_dict(), **extra}
             if result.ok:
-                store.mark_applied(fingerprint, result.to_dict())
+                store.mark_applied(fingerprint, outcome)
             else:
-                store.mark_failed(fingerprint, result.to_dict())
+                store.mark_failed(fingerprint, outcome)
         log.info("proposal %s approved by %s -> %s", fingerprint[:12], settings.reviewer_name, "applied" if result.ok else "failed")
         return RedirectResponse(f"/proposals/{fingerprint}?msg={'applied' if result.ok else 'failed'}", status_code=303)
 
